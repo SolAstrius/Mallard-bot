@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS nix_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Per-chat per-feature toggle. Missing row → use the in-code default for that
+-- feature name. Lets a chat opt out of `cha`/`roll` or opt into `npkg`/`nopt`.
+CREATE TABLE IF NOT EXISTS chat_features (
+    chat_id INTEGER NOT NULL,
+    feature TEXT    NOT NULL,
+    enabled INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, feature)
+);
 ";
 
 #[derive(Debug, Clone)]
@@ -355,6 +364,69 @@ impl Db {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    // ---------- per-chat feature toggles ----------
+
+    /// Returns the override stored for this chat/feature, or `None` if the
+    /// caller should fall back to the in-code default.
+    pub async fn feature_override(
+        &self,
+        chat_id: i64,
+        feature: &str,
+    ) -> rusqlite::Result<Option<bool>> {
+        let conn = self.conn.clone();
+        let feature = feature.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT enabled FROM chat_features WHERE chat_id = ?1 AND feature = ?2")?;
+            let mut rows = stmt.query(rusqlite::params![chat_id, feature])?;
+            if let Some(row) = rows.next()? {
+                let v: i64 = row.get(0)?;
+                Ok::<_, rusqlite::Error>(Some(v != 0))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn feature_set(
+        &self,
+        chat_id: i64,
+        feature: &str,
+        enabled: bool,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        let feature = feature.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO chat_features(chat_id, feature, enabled) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(chat_id, feature) DO UPDATE SET enabled = excluded.enabled",
+                rusqlite::params![chat_id, feature, if enabled { 1 } else { 0 }],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn feature_clear(&self, chat_id: i64, feature: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        let feature = feature.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "DELETE FROM chat_features WHERE chat_id = ?1 AND feature = ?2",
+                rusqlite::params![chat_id, feature],
+            )?;
+            Ok::<_, rusqlite::Error>(())
         })
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?

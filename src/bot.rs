@@ -68,6 +68,8 @@ pub enum Command {
     Nopt(String),
     #[command(description = "какой пакет даёт эту команду: /nixwhere mtr")]
     Nixwhere(String),
+    #[command(hide)]
+    Feature(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -339,6 +341,7 @@ async fn handle_command(
         Command::Npkg(r) => format!("npkg {r}").trim().to_string(),
         Command::Nopt(r) => format!("nopt {r}").trim().to_string(),
         Command::Nixwhere(r) => format!("nixwhere {r}").trim().to_string(),
+        Command::Feature(r) => format!("feature {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -360,14 +363,15 @@ async fn handle_command(
         Command::Qva(rest) | Command::Qwa(rest) => handle_qva(&bot, &msg, &rest, &config).await,
         Command::Voice(rest) => handle_voice(&bot, &msg, &rest, &config).await,
         Command::Import(rest) => handle_import(&bot, &msg, &rest, &config).await,
-        Command::Roll(rest) => handle_roll(&bot, &msg, &rest).await,
-        Command::Pick(rest) => handle_pick(&bot, &msg, &rest).await,
-        Command::Horoscope => handle_horoscope(&bot, &msg).await,
+        Command::Roll(rest) => handle_roll(&bot, &msg, &rest, &config).await,
+        Command::Pick(rest) => handle_pick(&bot, &msg, &rest, &config).await,
+        Command::Horoscope => handle_horoscope(&bot, &msg, &config).await,
         Command::Cha(rest) => handle_cha(&bot, &msg, &rest, &config).await,
         Command::Sip => handle_sip(&bot, &msg, &config).await,
         Command::Npkg(rest) => handle_npkg(&bot, &msg, &rest, &config).await,
         Command::Nopt(rest) => handle_nopt(&bot, &msg, &rest, &config).await,
         Command::Nixwhere(rest) => handle_nixwhere(&bot, &msg, &rest, &config).await,
+        Command::Feature(rest) => handle_feature(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -959,7 +963,15 @@ const HOROSCOPE_LINES: &[&str] = &[
     "если что-то идёт не так — это просто пельмени остыли",
 ];
 
-async fn handle_roll(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
+async fn handle_roll(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "roll").await {
+        return Ok(());
+    }
     // Full d20-style DSL via caith — supports advantage/disadvantage,
     // exploding (!), keep/drop (k/d), rerolls (r), targets (t), modifiers,
     // comments. Examples: "1d20", "2d20kh1+5", "4d6k3", "3d6!", "1d20 # save".
@@ -1023,7 +1035,15 @@ fn caith_md_to_html(s: &str) -> String {
     out
 }
 
-async fn handle_pick(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
+async fn handle_pick(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "pick").await {
+        return Ok(());
+    }
     use rand::seq::SliceRandom;
     let options: Vec<&str> = rest
         .split([',', '|', ';'])
@@ -1049,7 +1069,10 @@ async fn handle_pick(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn handle_horoscope(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
+async fn handle_horoscope(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "horoscope").await {
+        return Ok(());
+    }
     use crate::dictionaries::CREATURES;
     use rand::seq::SliceRandom;
     let body = {
@@ -1081,6 +1104,9 @@ async fn handle_cha(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "cha").await {
+        return Ok(());
+    }
     let Some(from) = msg.from.as_ref() else {
         return Ok(());
     };
@@ -1110,6 +1136,9 @@ async fn handle_cha(
 }
 
 async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "sip").await {
+        return Ok(());
+    }
     let Some(from) = msg.from.as_ref() else {
         return Ok(());
     };
@@ -1357,6 +1386,9 @@ async fn handle_npkg(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "npkg").await {
+        return Ok(());
+    }
     let q = rest.trim();
     if q.is_empty() {
         bot.send_message(msg.chat.id, "что искать-то? например: /npkg ripgrep")
@@ -1430,6 +1462,9 @@ async fn handle_nopt(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "nopt").await {
+        return Ok(());
+    }
     let q = rest.trim();
     if q.is_empty() {
         bot.send_message(
@@ -1503,6 +1538,9 @@ async fn handle_nixwhere(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "nixwhere").await {
+        return Ok(());
+    }
     let q = rest.trim();
     if q.is_empty() {
         bot.send_message(msg.chat.id, "какую команду искать? например: /nixwhere mtr")
@@ -1553,4 +1591,154 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+// ---------- per-chat feature toggles ----------
+
+/// In-code default for a feature when the chat has no explicit override.
+/// `npkg`/`nopt`/`nixwhere` default off (opt-in for nix-using chats);
+/// the cozy + utility extras default on (any chat can opt out via /feature).
+fn feature_default(name: &str) -> bool {
+    match name {
+        "npkg" | "nopt" | "nixwhere" => false,
+        "cha" | "sip" | "roll" | "pick" | "horoscope" => true,
+        _ => true,
+    }
+}
+
+const KNOWN_FEATURES: &[&str] = &[
+    "cha",
+    "sip",
+    "roll",
+    "pick",
+    "horoscope",
+    "npkg",
+    "nopt",
+    "nixwhere",
+];
+
+/// Resolve a feature flag for a chat: explicit override wins, else default.
+async fn is_feature_enabled(config: &BotConfig, chat: ChatId, name: &str) -> bool {
+    match config.db.feature_override(chat.0, name).await {
+        Ok(Some(v)) => v,
+        Ok(None) => feature_default(name),
+        Err(e) => {
+            log::warn!("feature_override({chat}, {name}) failed: {e}");
+            feature_default(name)
+        }
+    }
+}
+
+async fn handle_feature(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    // Admin-only — gated by TG_ADMIN_ID, matching /voice and /import.
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let Some(admin) = config.admin_id else {
+        return Ok(());
+    };
+    if from.id != admin {
+        return Ok(());
+    }
+
+    let trimmed = rest.trim();
+    let chat = msg.chat.id;
+
+    if trimmed.is_empty() {
+        // List current state for this chat.
+        let mut lines = vec![format!("\u{2699}\u{FE0F} флаги в чате {}:", chat.0)];
+        for name in KNOWN_FEATURES {
+            let on = is_feature_enabled(config, chat, name).await;
+            let src = match config.db.feature_override(chat.0, name).await {
+                Ok(Some(_)) => "явно",
+                _ => "по умолчанию",
+            };
+            let mark = if on { "\u{2705}" } else { "\u{274C}" };
+            lines.push(format!("  {mark} {name} ({src})"));
+        }
+        lines.push("управление: /feature <имя> on|off|reset".to_string());
+        bot.send_message(msg.chat.id, lines.join("\n"))
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let (name, action) = match parts.as_slice() {
+        [n, a] => (*n, a.to_lowercase()),
+        _ => {
+            bot.send_message(
+                msg.chat.id,
+                "формат: /feature <имя> on|off|reset (или /feature без аргументов — список)",
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+            return Ok(());
+        }
+    };
+    if !KNOWN_FEATURES.contains(&name) {
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "не знаю такой флаг: {name}. умею: {}",
+                KNOWN_FEATURES.join(", ")
+            ),
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let result = match action.as_str() {
+        "on" | "true" | "yes" | "1" => config
+            .db
+            .feature_set(chat.0, name, true)
+            .await
+            .map(|_| "on"),
+        "off" | "false" | "no" | "0" => config
+            .db
+            .feature_set(chat.0, name, false)
+            .await
+            .map(|_| "off"),
+        "reset" | "default" | "clear" => {
+            config.db.feature_clear(chat.0, name).await.map(|_| "reset")
+        }
+        _ => {
+            bot.send_message(msg.chat.id, "действие: on / off / reset")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    match result {
+        Ok(verb) => {
+            let resolved = is_feature_enabled(config, chat, name).await;
+            let mark = if resolved { "\u{2705}" } else { "\u{274C}" };
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "{mark} {name}: {verb} (сейчас {})",
+                    if resolved {
+                        "включён"
+                    } else {
+                        "выключен"
+                    }
+                ),
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+        }
+        Err(e) => {
+            log::warn!("feature toggle failed: {e}");
+            bot.send_message(msg.chat.id, "не ква, не получилось :(")
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+    }
+    Ok(())
 }
