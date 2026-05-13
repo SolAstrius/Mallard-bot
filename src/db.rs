@@ -252,19 +252,24 @@ impl Db {
     ) -> rusqlite::Result<Vec<NixPkgRow>> {
         let conn = self.conn.clone();
         let q = fts_phrase(query);
+        let raw = query.trim().to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            // Rank by FTS5 bm25 — lower is better. Boost exact attr_name
-            // matches by checking equality separately.
+            // Rank: exact attr_name / pname / main_program matches always win,
+            // then BM25 with strong attr_name weight. lower BM25 = better.
             let mut stmt = conn.prepare(
                 "SELECT attr_name, pname, version, description, long_description, main_program
                  FROM nix_pkg
                  WHERE nix_pkg MATCH ?1
-                 ORDER BY bm25(nix_pkg, 12.0, 8.0, 1.0, 1.5, 0.5, 4.0)
-                 LIMIT ?2",
+                 ORDER BY
+                   (attr_name = ?2) DESC,
+                   (pname = ?2) DESC,
+                   (main_program = ?2) DESC,
+                   bm25(nix_pkg, 12.0, 8.0, 1.0, 1.5, 0.5, 4.0)
+                 LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![q, limit], |row| {
+                .query_map(rusqlite::params![q, raw, limit], |row| {
                     Ok(NixPkgRow {
                         attr_name: row.get(0)?,
                         pname: row.get(1)?,

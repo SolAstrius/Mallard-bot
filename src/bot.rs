@@ -1469,8 +1469,11 @@ async fn handle_nopt(
         }
         if !top.description.is_empty() {
             let descr = top.description.trim();
-            let shown = if descr.len() > 600 {
-                format!("{}…", &descr[..600])
+            // Truncate by chars, not bytes — nixpkgs descriptions contain
+            // multibyte glyphs (‹›, em-dashes, CJK).
+            let shown = if descr.chars().count() > 600 {
+                let t: String = descr.chars().take(600).collect();
+                format!("{t}…")
             } else {
                 descr.to_string()
             };

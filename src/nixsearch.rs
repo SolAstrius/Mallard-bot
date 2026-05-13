@@ -190,18 +190,40 @@ fn parse_options(compressed: &[u8]) -> anyhow::Result<Vec<NixOptRow>> {
 /// - Bools/numbers/null → their literal form.
 /// - Objects/arrays → compact JSON, truncated.
 fn format_default(v: &serde_json::Value) -> String {
+    // NixOS options.json wraps non-trivial defaults in a tagged envelope:
+    //   { "_type": "literalExpression", "text": "false" }
+    //   { "_type": "literalMD", "text": "..." }
+    // Unwrap to the raw text so chat readers see `false`, not the envelope.
+    if let serde_json::Value::Object(map) = v {
+        let is_envelope = map
+            .get("_type")
+            .and_then(|t| t.as_str())
+            .map(|t| matches!(t, "literalExpression" | "literalMD"))
+            .unwrap_or(false);
+        if is_envelope {
+            if let Some(text) = map.get("text").and_then(|t| t.as_str()) {
+                return truncate_chars(text, 200);
+            }
+        }
+    }
     match v {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => s.clone(),
-        _ => {
-            let s = v.to_string();
-            if s.len() > 120 {
-                format!("{}…", &s[..120])
-            } else {
-                s
-            }
-        }
+        _ => truncate_chars(&v.to_string(), 120),
+    }
+}
+
+/// Truncate by *character count*, not bytes. Appends a `…` when truncation
+/// happens. nixpkgs descriptions and option defaults contain plenty of
+/// multibyte glyphs (‹›, em-dashes, CJK), so byte slicing is unsafe.
+fn truncate_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(n).collect();
+        format!("{truncated}…")
     }
 }
