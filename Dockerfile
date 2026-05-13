@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ---- builder ------------------------------------------------------------
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:1.90-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -12,7 +12,8 @@ RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && cargo build --release --locked \
-    && rm -rf src target/release/deps/mallard_bot* target/release/deps/mallard-bot*
+    && cargo clean --release -p mallard-bot \
+    && rm -rf src
 
 COPY . .
 RUN cargo build --release --locked
@@ -29,7 +30,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /build/target/release/mallard-bot /usr/local/bin/mallard-bot
 COPY content ./content
-COPY voices ./voices
+# Baked voice library — initContainer seeds these into the PVC-mounted
+# /app/voices on first start (cp -rn, so user-added clips win on conflict).
+COPY voices ./default-voices
 
 ENV RUST_LOG=info
 CMD ["mallard-bot"]

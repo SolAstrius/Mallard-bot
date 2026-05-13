@@ -8,6 +8,18 @@ metadata:
 #     --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -
 # Do NOT commit a Secret manifest with real values to this repo.
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mallard-voices
+  namespace: mallard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: openebs-zfs
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,6 +40,17 @@ spec:
       labels:
         app: mallard-bot
     spec:
+      initContainers:
+        # Seed the persistent voices/ PVC from the image-baked defaults the
+        # first time the pod starts. `cp -rn` (no-clobber) means user-added
+        # clips persist across image upgrades.
+        - name: seed-voices
+          image: mallard-bot:28679ff
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cp -rn /app/default-voices/. /app/voices/ || true"]
+          volumeMounts:
+            - name: voices
+              mountPath: /app/voices
       containers:
         - name: bot
           image: mallard-bot:28679ff
@@ -38,6 +61,9 @@ spec:
           env:
             - name: RUST_LOG
               value: "info"
+          volumeMounts:
+            - name: voices
+              mountPath: /app/voices
           resources:
             requests:
               cpu: "50m"
@@ -45,3 +71,7 @@ spec:
             limits:
               cpu: "1500m"
               memory: "1Gi"
+      volumes:
+        - name: voices
+          persistentVolumeClaim:
+            claimName: mallard-voices
