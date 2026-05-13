@@ -936,7 +936,14 @@ async fn handle_roll(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()>
 
     let body = match caith::Roller::new(expr) {
         Ok(roller) => match roller.roll() {
-            Ok(result) => format!("\u{1F3B2} {result}"),
+            // caith emits its own markdown (backticks for dice values, ** for
+            // selected ones). Strip it — we send as plain text so Telegram
+            // doesn't render the markup, and trying to forward it through
+            // Telegram's MarkdownV2 needs too much escaping.
+            Ok(result) => format!(
+                "\u{1F3B2} {}",
+                result.to_string().replace("**", "").replace('`', "")
+            ),
             Err(e) => format!("не ква, не получилось бросить: {e}"),
         },
         Err(e) => format!("не ква, не понял выражение: {e}"),
