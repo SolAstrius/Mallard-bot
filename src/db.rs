@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS chat_features (
     enabled INTEGER NOT NULL,
     PRIMARY KEY (chat_id, feature)
 );
+
+-- (user, chat) presence map populated from any message we see. Powers
+-- /cha gossip's 'we share a chat' lookup. `last_seen` lets future code
+-- threshold out long-dormant memberships.
+CREATE TABLE IF NOT EXISTS user_membership (
+    user_id   INTEGER NOT NULL,
+    chat_id   INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    user_name TEXT    NOT NULL,
+    PRIMARY KEY (user_id, chat_id)
+);
+
+-- Per-user opt-in for cross-chat tea presence. Mutual: you only see opted-in
+-- users; you only appear in others' lists if you're opted in yourself.
+CREATE TABLE IF NOT EXISTS cha_gossip_optin (
+    user_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL
+);
 ";
 
 #[derive(Debug, Clone)]
@@ -427,6 +445,90 @@ impl Db {
                 rusqlite::params![chat_id, feature],
             )?;
             Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    // ---------- gossip (cross-chat tea presence) ----------
+
+    /// Upsert a row in `user_membership` — bumped on every incoming message.
+    pub async fn bump_membership(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        user_name: String,
+        now_unix: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO user_membership(user_id, chat_id, last_seen, user_name)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(user_id, chat_id) DO UPDATE SET
+                     last_seen = excluded.last_seen,
+                     user_name = excluded.user_name",
+                rusqlite::params![user_id, chat_id, now_unix, user_name],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn gossip_get(&self, user_id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt =
+                conn.prepare("SELECT enabled FROM cha_gossip_optin WHERE user_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![user_id])?;
+            if let Some(row) = rows.next()? {
+                let v: i64 = row.get(0)?;
+                Ok::<_, rusqlite::Error>(v != 0)
+            } else {
+                Ok(false)
+            }
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn gossip_set(&self, user_id: i64, enabled: bool) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO cha_gossip_optin(user_id, enabled) VALUES(?1, ?2)
+                 ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled",
+                rusqlite::params![user_id, if enabled { 1 } else { 0 }],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// User IDs of opted-in users who share at least one chat with `asker`.
+    pub async fn gossip_targets(&self, asker: i64) -> rusqlite::Result<Vec<i64>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT m_other.user_id
+                 FROM   user_membership m_self
+                 JOIN   user_membership m_other
+                        ON m_self.chat_id = m_other.chat_id
+                       AND m_other.user_id <> m_self.user_id
+                 WHERE  m_self.user_id = ?1
+                   AND  m_other.user_id IN
+                        (SELECT user_id FROM cha_gossip_optin WHERE enabled = 1)",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![asker], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
         })
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?

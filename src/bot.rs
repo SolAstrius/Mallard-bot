@@ -177,13 +177,15 @@ const HELP_NFLAKE: &str = "/nflake <имя> — разрешает имя чер
 кря-кря.";
 
 const HELP_CHA: &str = "/cha — чайная сессия.\n\
-Кряква считает заварки и помнит, кто сейчас пьёт чай в этом чате.\n\
+Кряква считает заварки и помнит, кто сейчас пьёт чай.\n\
 * /cha <название> — начать сессию (название — свободный текст)\n\
 * /sip — следующая заварка в твоей активной сессии\n\
-* /cha note <заметка> — добавить заметку к текущей сессии\n\
+* /cha note <заметка> — добавить заметку\n\
 * /cha end — закрыть сессию\n\
-* /cha who — кто сейчас пьёт чай в этом чате\n\
-* /cha log — последние 10 закрытых сессий\n\
+* /cha who — кто сейчас пьёт в этом чате\n\
+* /cha log — последние 10 закрытых сессий в этом чате\n\
+* /cha gossip — кто сейчас пьёт в любых ваших общих чатах (opt-in)\n\
+* /cha gossip on|off — подключиться/отключиться от кросс-чатовой видимости\n\
 * /cha — без аргументов: статус твоей активной сессии или эта подсказка.\n\
 Сессии автоматически закрываются после 90 минут без активности.\n\
 кря-кря.";
@@ -292,7 +294,13 @@ async fn download_file(bot: &Bot, file_id: FileId) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
-async fn handle_text(bot: Bot, msg: Message, mallard: SharedMallard) -> anyhow::Result<()> {
+async fn handle_text(
+    bot: Bot,
+    msg: Message,
+    mallard: SharedMallard,
+    config: BotConfig,
+) -> anyhow::Result<()> {
+    track_membership(&msg, &config).await;
     let text = match msg.text().or_else(|| msg.caption()) {
         Some(t) => t.to_string(),
         None => return Ok(()),
@@ -339,6 +347,7 @@ async fn handle_command(
     config: BotConfig,
     _mallard: SharedMallard,
 ) -> anyhow::Result<()> {
+    track_membership(&msg, &config).await;
     let cmd_label = match &cmd {
         Command::Help(r) => format!("help {r}").trim().to_string(),
         Command::Id => "id".to_string(),
@@ -1148,6 +1157,7 @@ async fn handle_cha(
         "" => cha_status_or_help(bot, msg, config, key).await,
         "who" => cha_who(bot, msg, config).await,
         "log" => cha_log(bot, msg, config, chat_id).await,
+        "gossip" => cha_gossip(bot, msg, config, sub_arg).await,
         "end" => cha_end(bot, msg, config, key).await,
         "note" if !sub_arg.is_empty() => cha_note(bot, msg, config, key, sub_arg).await,
         _ => cha_start(bot, msg, config, chat_id, user_id, user_name, trimmed).await,
@@ -1175,7 +1185,7 @@ async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Res
     let body = match summary {
         Some((name, tea, steeps)) => {
             format!(
-                "\u{1F375} {ord}-я заварка · {name} · {tea}",
+                "\u{1F375} {ord}-я заварка, {name}, {tea}",
                 ord = steeps,
                 name = name,
                 tea = tea
@@ -1234,7 +1244,7 @@ async fn cha_status_or_help(
     };
     let body = match snapshot {
         Some(s) => format!(
-            "\u{1F375} {} · {} заварок · {}",
+            "\u{1F375} {}, {} заварок, {}",
             s.tea,
             s.steeps,
             fmt_dur(s.elapsed())
@@ -1292,7 +1302,7 @@ async fn cha_end(
         return Ok(());
     };
     let body = format!(
-        "\u{1FAD6} {} закрыл(а) сессию: {} · {} заварок · {}\nкряква уважает",
+        "\u{1FAD6} {} закрыл(а) сессию: {}, {} заварок, {}\nкряква уважает",
         session.user_name,
         session.tea,
         session.steeps,
@@ -1329,12 +1339,12 @@ async fn cha_who(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result
             .collect()
     };
     let body = if active.is_empty() {
-        "никто сейчас не пьёт чай :(\nможет ты начнёшь?".to_string()
+        "тихо :(\nможет ты начнёшь?".to_string()
     } else {
-        let mut lines = vec!["\u{1F375} кто сейчас пьёт чай:".to_string()];
+        let mut lines = vec!["\u{1F375} кто сейчас пьёт:".to_string()];
         for (name, tea, steeps, elapsed, idle) in active {
             lines.push(format!(
-                "  {name} · {tea} · {steeps} заварок · {ago} назад",
+                "  {name}, {tea}, {steeps} заварок, {ago}",
                 ago = fmt_dur(idle.max(elapsed))
             ));
         }
@@ -1355,20 +1365,20 @@ async fn cha_log(bot: &Bot, msg: &Message, config: &BotConfig, chat: ChatId) -> 
         }
     };
     let body = if rows.is_empty() {
-        "журнал пуст. начните сессию через /cha <название>".to_string()
+        "журнал пуст :(\nначни через /cha <название>".to_string()
     } else {
         let mut lines = vec!["\u{1F4D6} последние сессии:".to_string()];
         for r in rows {
             let when = format_unix_short(r.started_at);
             let dur = fmt_dur(std::time::Duration::from_secs(r.duration_s as u64));
-            let auto = if r.auto_closed { " · авто" } else { "" };
+            let auto = if r.auto_closed { ", авто" } else { "" };
             let notes = parse_notes(&r.notes_json);
             let mut entry = format!(
-                "  {when} · {} · {} · {} заварок · {dur}{auto}",
+                "  {when}, {}, {}, {} заварок, {dur}{auto}",
                 r.user_name, r.tea, r.steeps
             );
             if !notes.is_empty() {
-                entry.push_str(&format!("\n    заметки: {}", notes.join(" · ")));
+                entry.push_str(&format!("\n    заметки: {}", notes.join(", ")));
             }
             lines.push(entry);
         }
@@ -1933,6 +1943,129 @@ async fn handle_nflake(
     }
     bot.send_message(msg.chat.id, lines.join("\n"))
         .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+// ---------- /cha gossip — cross-chat presence ----------
+
+/// Bump (user, chat) membership in the DB. Cheap upsert per incoming msg.
+/// Skipped for bots, for messages without a sender, and for private chats
+/// (where membership is just user→bot — not useful for cross-chat lookup).
+async fn track_membership(msg: &Message, config: &BotConfig) {
+    let Some(from) = msg.from.as_ref() else {
+        return;
+    };
+    if from.is_bot {
+        return;
+    }
+    if matches!(msg.chat.kind, ChatKind::Private(_)) {
+        return;
+    }
+    let user_name = from
+        .username
+        .as_ref()
+        .map(|n| format!("@{n}"))
+        .unwrap_or_else(|| from.full_name());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Err(e) = config
+        .db
+        .bump_membership(from.id.0 as i64, msg.chat.id.0, user_name, now)
+        .await
+    {
+        log::warn!("bump_membership failed: {e}");
+    }
+}
+
+async fn cha_gossip(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    action: &str,
+) -> anyhow::Result<()> {
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let user_id = from.id.0 as i64;
+
+    match action {
+        "on" | "true" | "enable" | "yes" | "1" => {
+            if let Err(e) = config.db.gossip_set(user_id, true).await {
+                log::warn!("gossip_set on failed: {e}");
+            }
+            bot.send_message(msg.chat.id, "🍃 /cha gossip включён. ты теперь видимый.")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+        "off" | "false" | "disable" | "no" | "0" => {
+            if let Err(e) = config.db.gossip_set(user_id, false).await {
+                log::warn!("gossip_set off failed: {e}");
+            }
+            bot.send_message(msg.chat.id, "🍃 /cha gossip выключен.")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+        "" => {}
+        _ => {
+            bot.send_message(
+                msg.chat.id,
+                "формат: /cha gossip on|off (или /cha gossip — список)",
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // List mode — requires opt-in.
+    let opted_in = config.db.gossip_get(user_id).await.unwrap_or(false);
+    if !opted_in {
+        bot.send_message(
+            msg.chat.id,
+            "/cha gossip у тебя выключен. включить: /cha gossip on",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let target_ids: std::collections::HashSet<i64> = match config.db.gossip_targets(user_id).await {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            log::warn!("gossip_targets failed: {e}");
+            std::collections::HashSet::new()
+        }
+    };
+
+    // Cross-reference against the in-memory session store.
+    let snapshot: Vec<(String, String, u32, std::time::Duration)> = {
+        let store = config.tea_sessions.lock().await;
+        store
+            .iter()
+            .filter(|((_, user), _)| target_ids.contains(&(user.0 as i64)))
+            .map(|(_, s)| (s.user_name.clone(), s.tea.clone(), s.steeps, s.idle_for()))
+            .collect()
+    };
+
+    let body = if snapshot.is_empty() {
+        "тихо :(".to_string()
+    } else {
+        let mut lines = vec!["\u{1F343} кто сейчас пьёт:".to_string()];
+        for (name, tea, steeps, idle) in snapshot {
+            lines.push(format!(
+                "  {name}, {tea}, {steeps} заварок, {ago}",
+                ago = crate::sessions::fmt_dur(idle)
+            ));
+        }
+        lines.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
