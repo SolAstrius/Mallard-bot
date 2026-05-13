@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         // Poll until populated.
         let deadline = std::time::Instant::now() + Duration::from_secs(180);
         loop {
-            if let Some(_) = db.nix_meta_get("nix_last_refresh_unix").await? {
+            if db.nix_meta_get("nix_last_refresh_unix").await?.is_some() {
                 break;
             }
             if std::time::Instant::now() > deadline {

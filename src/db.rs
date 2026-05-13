@@ -79,6 +79,7 @@ impl Db {
     }
 
     /// Insert a closed cha session.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_cha_session(
         &self,
         chat_id: i64,

@@ -1026,7 +1026,7 @@ fn caith_md_to_html(s: &str) -> String {
 async fn handle_pick(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
     use rand::seq::SliceRandom;
     let options: Vec<&str> = rest
-        .split(|c: char| c == ',' || c == '|' || c == ';')
+        .split([',', '|', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
@@ -1391,7 +1391,7 @@ async fn handle_npkg(
             html_escape(&top.attr_name),
             html_escape(&top.version)
         )];
-        lines.push(format!("{}", html_escape(descr)));
+        lines.push(html_escape(descr));
         lines.push(format!(
             "• <code>nix run nixpkgs#{}</code>",
             html_escape(&top.attr_name)
