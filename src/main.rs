@@ -9,6 +9,8 @@ use teloxide::types::{BotCommandScope, Recipient};
 use teloxide::utils::command::BotCommands as _;
 
 use mallard_bot::bot::{build_dispatcher, BotConfig, Command};
+use mallard_bot::db::Db;
+use mallard_bot::sessions::{new_store, spawn_reaper};
 use mallard_bot::stickerpack::StickerPack;
 use mallard_bot::Mallard;
 
@@ -72,7 +74,22 @@ async fn main() -> anyhow::Result<()> {
             .await;
     }
 
-    let config = BotConfig { admin_id, pack };
+    // SQLite lives on the PVC alongside the voices/ dir — same durable mount.
+    let db_path = env::var("MALLARD_DB_PATH")
+        .unwrap_or_else(|_| "/app/voices/mallard.db".to_string());
+    let db = Db::open(std::path::Path::new(&db_path))
+        .map_err(|e| anyhow::anyhow!("open db {db_path}: {e}"))?;
+    log::info!("db open at {db_path}");
+
+    let tea_sessions = new_store();
+    spawn_reaper(tea_sessions.clone(), db.clone());
+
+    let config = BotConfig {
+        admin_id,
+        pack,
+        db,
+        tea_sessions,
+    };
 
     build_dispatcher(bot, mallard, config).dispatch().await;
     Ok(())

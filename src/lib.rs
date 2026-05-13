@@ -1,12 +1,14 @@
 pub mod arguments;
 pub mod bot;
 pub mod content;
+pub mod db;
 pub mod dictionaries;
 pub mod exceptions;
 pub mod imaging;
 pub mod mallard;
 pub mod quote;
 pub mod responses;
+pub mod sessions;
 pub mod stickerpack;
 pub mod video;
 

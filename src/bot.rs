@@ -29,6 +29,8 @@ pub type SharedMallard = Arc<Mutex<Mallard>>;
 pub struct BotConfig {
     pub admin_id: Option<UserId>,
     pub pack: Option<StickerPack>,
+    pub db: crate::db::Db,
+    pub tea_sessions: crate::sessions::SessionStore,
 }
 
 #[derive(BotCommands, Clone)]
@@ -56,6 +58,10 @@ pub enum Command {
     Pick(String),
     #[command(description = "гороскоп на сегодня для одной из зверушек")]
     Horoscope,
+    #[command(description = "чайная сессия: /cha <чай>, /cha who, /cha log, /cha end")]
+    Cha(String),
+    #[command(description = "следующая заварка в активной сессии")]
+    Sip,
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -132,6 +138,18 @@ const HELP_HOROSCOPE: &str = "/horoscope даёт прогноз дня для �
 Точность гарантируется в пределах разумного.\n\
 кря-кря.";
 
+const HELP_CHA: &str = "/cha — чайная сессия.\n\
+Кряква считает заварки и помнит, кто сейчас пьёт чай в этом чате.\n\
+* /cha <название> — начать сессию (название — свободный текст)\n\
+* /sip — следующая заварка в твоей активной сессии\n\
+* /cha note <заметка> — добавить заметку к текущей сессии\n\
+* /cha end — закрыть сессию\n\
+* /cha who — кто сейчас пьёт чай в этом чате\n\
+* /cha log — последние 10 закрытых сессий\n\
+* /cha — без аргументов: статус твоей активной сессии или эта подсказка.\n\
+Сессии автоматически закрываются после 90 минут без активности.\n\
+кря-кря.";
+
 fn help_for(query: &str) -> String {
     let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
     match q.as_str() {
@@ -145,6 +163,7 @@ fn help_for(query: &str) -> String {
         "roll" => HELP_ROLL.to_string(),
         "pick" => HELP_PICK.to_string(),
         "horoscope" => HELP_HOROSCOPE.to_string(),
+        "cha" | "sip" => HELP_CHA.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -289,6 +308,8 @@ async fn handle_command(
         Command::Roll(r) => format!("roll {r}").trim().to_string(),
         Command::Pick(r) => format!("pick {r}").trim().to_string(),
         Command::Horoscope => "horoscope".to_string(),
+        Command::Cha(r) => format!("cha {r}").trim().to_string(),
+        Command::Sip => "sip".to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -313,6 +334,8 @@ async fn handle_command(
         Command::Roll(rest) => handle_roll(&bot, &msg, &rest).await,
         Command::Pick(rest) => handle_pick(&bot, &msg, &rest).await,
         Command::Horoscope => handle_horoscope(&bot, &msg).await,
+        Command::Cha(rest) => handle_cha(&bot, &msg, &rest, &config).await,
+        Command::Sip => handle_sip(&bot, &msg, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -968,4 +991,274 @@ async fn handle_horoscope(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
+}
+
+// ---------- /cha + /sip — gong fu cha session tracking ----------
+
+use crate::sessions::{fmt_dur, parse_notes, persist, TeaSession};
+
+const CHA_AUTO_CLOSE_NOTE: bool = false;
+
+async fn handle_cha(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let user_id = from.id;
+    let user_name = from
+        .username
+        .as_ref()
+        .map(|n| format!("@{n}"))
+        .unwrap_or_else(|| from.full_name());
+    let chat_id = msg.chat.id;
+    let key = (chat_id, user_id);
+
+    let trimmed = rest.trim();
+    let (sub, sub_arg) = match trimmed.split_once(char::is_whitespace) {
+        Some((s, a)) => (s.to_lowercase(), a.trim()),
+        None => (trimmed.to_lowercase(), ""),
+    };
+
+    match sub.as_str() {
+        "" => cha_status_or_help(bot, msg, config, key).await,
+        "who" => cha_who(bot, msg, config).await,
+        "log" => cha_log(bot, msg, config, chat_id).await,
+        "end" => cha_end(bot, msg, config, key).await,
+        "note" if !sub_arg.is_empty() => cha_note(bot, msg, config, key, sub_arg).await,
+        _ => cha_start(bot, msg, config, chat_id, user_id, user_name, trimmed).await,
+    }
+}
+
+async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let key = (msg.chat.id, from.id);
+    let summary = {
+        let mut store = config.tea_sessions.lock().await;
+        match store.get_mut(&key) {
+            Some(s) => {
+                s.sip();
+                Some((s.user_name.clone(), s.tea.clone(), s.steeps))
+            }
+            None => None,
+        }
+    };
+    let body = match summary {
+        Some((name, tea, steeps)) => {
+            format!("\u{1F375} {ord}-я заварка · {name} · {tea}",
+                ord = steeps, name = name, tea = tea)
+        }
+        None => "у тебя нет активной сессии. начни через /cha <название>".to_string(),
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn cha_start(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    chat_id: ChatId,
+    user_id: UserId,
+    user_name: String,
+    tea: &str,
+) -> anyhow::Result<()> {
+    let tea = if tea.is_empty() { "?" } else { tea };
+    let key = (chat_id, user_id);
+    let previous = {
+        let mut store = config.tea_sessions.lock().await;
+        let prev = store.remove(&key);
+        store.insert(
+            key,
+            TeaSession::new(chat_id, user_id, user_name.clone(), tea.to_string()),
+        );
+        prev
+    };
+    // If a session was already running, persist it as auto-closed-by-restart.
+    if let Some(prev) = previous {
+        persist(&config.db, &prev, true).await;
+    }
+    bot.send_message(
+        msg.chat.id,
+        format!("\u{1FAD6} {user_name} начал(а) сессию: {tea}\nкряква садится рядом \u{1F60C}"),
+    )
+    .reply_parameters(reply_params(msg))
+    .await?;
+    Ok(())
+}
+
+async fn cha_status_or_help(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    key: (ChatId, UserId),
+) -> anyhow::Result<()> {
+    let snapshot = {
+        let store = config.tea_sessions.lock().await;
+        store.get(&key).cloned()
+    };
+    let body = match snapshot {
+        Some(s) => format!(
+            "\u{1F375} {} · {} заварок · {}",
+            s.tea,
+            s.steeps,
+            fmt_dur(s.elapsed())
+        ),
+        None => HELP_CHA.to_string(),
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn cha_note(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    key: (ChatId, UserId),
+    text: &str,
+) -> anyhow::Result<()> {
+    let ok = {
+        let mut store = config.tea_sessions.lock().await;
+        match store.get_mut(&key) {
+            Some(s) => {
+                s.add_note(text.to_string());
+                true
+            }
+            None => false,
+        }
+    };
+    let body = if ok {
+        "\u{2713} записано".to_string()
+    } else {
+        "у тебя нет активной сессии :(".to_string()
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn cha_end(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    key: (ChatId, UserId),
+) -> anyhow::Result<()> {
+    let closed = {
+        let mut store = config.tea_sessions.lock().await;
+        store.remove(&key)
+    };
+    let Some(session) = closed else {
+        bot.send_message(msg.chat.id, "у тебя нет активной сессии :(")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    };
+    let body = format!(
+        "\u{1FAD6} {} закрыл(а) сессию: {} · {} заварок · {}\nкряква уважает",
+        session.user_name,
+        session.tea,
+        session.steeps,
+        fmt_dur(session.elapsed()),
+    );
+    persist(&config.db, &session, CHA_AUTO_CLOSE_NOTE).await;
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn cha_who(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    let active: Vec<(String, String, u32, std::time::Duration, std::time::Duration)> = {
+        let store = config.tea_sessions.lock().await;
+        store
+            .iter()
+            .filter(|((c, _), _)| *c == msg.chat.id)
+            .map(|(_, s)| {
+                (
+                    s.user_name.clone(),
+                    s.tea.clone(),
+                    s.steeps,
+                    s.elapsed(),
+                    s.idle_for(),
+                )
+            })
+            .collect()
+    };
+    let body = if active.is_empty() {
+        "никто сейчас не пьёт чай :(\nможет ты начнёшь?".to_string()
+    } else {
+        let mut lines = vec!["\u{1F375} кто сейчас пьёт чай:".to_string()];
+        for (name, tea, steeps, elapsed, idle) in active {
+            lines.push(format!(
+                "  {name} · {tea} · {steeps} заварок · {ago} назад",
+                ago = fmt_dur(idle.max(elapsed))
+            ));
+        }
+        lines.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn cha_log(bot: &Bot, msg: &Message, config: &BotConfig, chat: ChatId) -> anyhow::Result<()> {
+    let rows = match config.db.tail_cha_log(chat.0, 10).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("cha_log query failed: {e}");
+            Vec::new()
+        }
+    };
+    let body = if rows.is_empty() {
+        "журнал пуст. начните сессию через /cha <название>".to_string()
+    } else {
+        let mut lines = vec!["\u{1F4D6} последние сессии:".to_string()];
+        for r in rows {
+            let when = format_unix_short(r.started_at);
+            let dur = fmt_dur(std::time::Duration::from_secs(r.duration_s as u64));
+            let auto = if r.auto_closed { " · авто" } else { "" };
+            let notes = parse_notes(&r.notes_json);
+            let mut entry = format!(
+                "  {when} · {} · {} · {} заварок · {dur}{auto}",
+                r.user_name, r.tea, r.steeps
+            );
+            if !notes.is_empty() {
+                entry.push_str(&format!("\n    заметки: {}", notes.join(" · ")));
+            }
+            lines.push(entry);
+        }
+        lines.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+fn format_unix_short(unix_secs: i64) -> String {
+    // Minimal "x ago"-ish formatter: minutes / hours / days. Avoids pulling in
+    // chrono for one timestamp render.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(unix_secs);
+    let delta = (now - unix_secs).max(0);
+    if delta < 3600 {
+        format!("{} мин назад", (delta / 60).max(1))
+    } else if delta < 86_400 {
+        format!("{} ч назад", delta / 3600)
+    } else {
+        format!("{} дн назад", delta / 86_400)
+    }
 }
