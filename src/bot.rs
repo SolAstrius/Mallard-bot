@@ -1018,8 +1018,8 @@ async fn handle_pick(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()>
 }
 
 async fn handle_horoscope(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
-    use rand::seq::SliceRandom;
     use crate::dictionaries::CREATURES;
+    use rand::seq::SliceRandom;
     let body = {
         let mut rng = rand::thread_rng();
         let creature = CREATURES.choose(&mut rng).copied().unwrap_or("Я уточка!");
@@ -1094,8 +1094,12 @@ async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Res
     };
     let body = match summary {
         Some((name, tea, steeps)) => {
-            format!("\u{1F375} {ord}-я заварка · {name} · {tea}",
-                ord = steeps, name = name, tea = tea)
+            format!(
+                "\u{1F375} {ord}-я заварка · {name} · {tea}",
+                ord = steeps,
+                name = name,
+                tea = tea
+            )
         }
         None => "у тебя нет активной сессии. начни через /cha <название>".to_string(),
     };
@@ -1222,7 +1226,13 @@ async fn cha_end(
 }
 
 async fn cha_who(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
-    let active: Vec<(String, String, u32, std::time::Duration, std::time::Duration)> = {
+    let active: Vec<(
+        String,
+        String,
+        u32,
+        std::time::Duration,
+        std::time::Duration,
+    )> = {
         let store = config.tea_sessions.lock().await;
         store
             .iter()
