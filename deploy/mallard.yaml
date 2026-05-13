@@ -20,6 +20,18 @@ spec:
     requests:
       storage: 1Gi
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mallard-data
+  namespace: mallard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: openebs-zfs
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -64,6 +76,8 @@ spec:
           volumeMounts:
             - name: voices
               mountPath: /app/voices
+            - name: data
+              mountPath: /app/data
           resources:
             requests:
               cpu: "50m"
@@ -75,3 +89,6 @@ spec:
         - name: voices
           persistentVolumeClaim:
             claimName: mallard-voices
+        - name: data
+          persistentVolumeClaim:
+            claimName: mallard-data

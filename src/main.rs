@@ -74,9 +74,9 @@ async fn main() -> anyhow::Result<()> {
             .await;
     }
 
-    // SQLite lives on the PVC alongside the voices/ dir — same durable mount.
+    // SQLite lives on its own PVC, separate from the voices/ audio bucket.
     let db_path = env::var("MALLARD_DB_PATH")
-        .unwrap_or_else(|_| "/app/voices/mallard.db".to_string());
+        .unwrap_or_else(|_| "/app/data/mallard.db".to_string());
     let db = Db::open(std::path::Path::new(&db_path))
         .map_err(|e| anyhow::anyhow!("open db {db_path}: {e}"))?;
     log::info!("db open at {db_path}");
