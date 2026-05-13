@@ -68,6 +68,10 @@ pub enum Command {
     Nopt(String),
     #[command(description = "какой пакет даёт эту команду: /nixwhere mtr")]
     Nixwhere(String),
+    #[command(description = "ревизия канала: /nchan [nixos-unstable]")]
+    Nchan(String),
+    #[command(description = "flake registry: /nflake nixpkgs")]
+    Nflake(String),
     #[command(description = "флаги в чате: /feature, /feature a,b,c on|off|reset (для админов)")]
     Feature(String),
 }
@@ -163,6 +167,15 @@ const HELP_NIXWHERE: &str = "/nixwhere <команда> — какой паке�
 Например: /nixwhere mtr\n\
 кря-кря.";
 
+const HELP_NCHAN: &str = "/nchan [канал] — текущее состояние канала nixpkgs.\n\
+Без аргументов — nixos-unstable. Возвращает SHA коммита, snapshot-метку и ссылку на GitHub.\n\
+кря-кря.";
+
+const HELP_NFLAKE: &str = "/nflake <имя> — разрешает имя через nixpkgs flake registry.\n\
+Тянет channels.nixos.org/flake-registry.json и ищет указанный input.\n\
+Например: /nflake nixpkgs, /nflake home-manager\n\
+кря-кря.";
+
 const HELP_CHA: &str = "/cha — чайная сессия.\n\
 Кряква считает заварки и помнит, кто сейчас пьёт чай в этом чате.\n\
 * /cha <название> — начать сессию (название — свободный текст)\n\
@@ -192,6 +205,8 @@ fn help_for(query: &str) -> String {
         "npkg" => HELP_NPKG.to_string(),
         "nopt" => HELP_NOPT.to_string(),
         "nixwhere" => HELP_NIXWHERE.to_string(),
+        "nchan" => HELP_NCHAN.to_string(),
+        "nflake" => HELP_NFLAKE.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -341,6 +356,8 @@ async fn handle_command(
         Command::Npkg(r) => format!("npkg {r}").trim().to_string(),
         Command::Nopt(r) => format!("nopt {r}").trim().to_string(),
         Command::Nixwhere(r) => format!("nixwhere {r}").trim().to_string(),
+        Command::Nchan(r) => format!("nchan {r}").trim().to_string(),
+        Command::Nflake(r) => format!("nflake {r}").trim().to_string(),
         Command::Feature(r) => format!("feature {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
@@ -371,6 +388,8 @@ async fn handle_command(
         Command::Npkg(rest) => handle_npkg(&bot, &msg, &rest, &config).await,
         Command::Nopt(rest) => handle_nopt(&bot, &msg, &rest, &config).await,
         Command::Nixwhere(rest) => handle_nixwhere(&bot, &msg, &rest, &config).await,
+        Command::Nchan(rest) => handle_nchan(&bot, &msg, &rest, &config).await,
+        Command::Nflake(rest) => handle_nflake(&bot, &msg, &rest, &config).await,
         Command::Feature(rest) => handle_feature(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
@@ -1600,7 +1619,7 @@ fn html_escape(s: &str) -> String {
 /// the cozy + utility extras default on (any chat can opt out via /feature).
 fn feature_default(name: &str) -> bool {
     match name {
-        "npkg" | "nopt" | "nixwhere" => false,
+        "npkg" | "nopt" | "nixwhere" | "nchan" | "nflake" => false,
         "cha" | "sip" | "roll" | "pick" | "horoscope" => true,
         _ => true,
     }
@@ -1615,6 +1634,8 @@ const KNOWN_FEATURES: &[&str] = &[
     "npkg",
     "nopt",
     "nixwhere",
+    "nchan",
+    "nflake",
 ];
 
 /// Resolve a feature flag for a chat: explicit override wins, else default.
@@ -1812,6 +1833,106 @@ async fn handle_feature(
         lines.push(format!("ошибка на: {}", failed.join(", ")));
     }
     bot.send_message(msg.chat.id, lines.join("\n"))
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+// ---------- /nchan + /nflake — live nix channel & flake registry ----------
+
+async fn handle_nchan(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "nchan").await {
+        return Ok(());
+    }
+    let arg = rest.trim();
+    let channel = if arg.is_empty() { None } else { Some(arg) };
+    let info = match crate::nixstatus::fetch_channel(channel).await {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("nchan fetch failed: {e:#}");
+            bot.send_message(msg.chat.id, "не ква, channels.nixos.org не отвечает :(")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    let short = info.revision.chars().take(12).collect::<String>();
+    let mut lines = vec![format!("\u{1F33F} <b>{}</b>", html_escape(&info.channel))];
+    if let Some(label) = &info.version_label {
+        lines.push(format!("snapshot: <code>{}</code>", html_escape(label)));
+    }
+    lines.push(format!(
+        "коммит: <a href=\"https://github.com/NixOS/nixpkgs/commit/{}\"><code>{}</code></a>",
+        html_escape(&info.revision),
+        html_escape(&short)
+    ));
+    bot.send_message(msg.chat.id, lines.join("\n"))
+        .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn handle_nflake(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "nflake").await {
+        return Ok(());
+    }
+    let q = rest.trim();
+    if q.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "формат: /nflake <имя>, например /nflake nixpkgs",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+    let registry = match crate::nixstatus::fetch_flake_registry().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("nflake fetch failed: {e:#}");
+            bot.send_message(msg.chat.id, "не ква, flake-registry.json не отвечает :(")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(entry) = crate::nixstatus::lookup_flake(&registry, q) else {
+        bot.send_message(
+            msg.chat.id,
+            format!("«{}» нет в flake registry. может, добавьте?", q),
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    };
+    let from_id = entry.from.id.as_deref().unwrap_or(q);
+    let to_render = crate::nixstatus::to_url(&entry.to);
+    let github_link = match (entry.to.kind.as_str(), &entry.to.owner, &entry.to.repo) {
+        ("github", Some(owner), Some(repo)) => Some(format!("https://github.com/{owner}/{repo}")),
+        _ => None,
+    };
+    let mut lines = vec![format!("\u{1F9A9} <b>{}</b>", html_escape(from_id))];
+    lines.push(format!("→ <code>{}</code>", html_escape(&to_render)));
+    if let Some(link) = github_link {
+        lines.push(format!(
+            "<a href=\"{}\">{}</a>",
+            html_escape(&link),
+            html_escape(&link)
+        ));
+    }
+    bot.send_message(msg.chat.id, lines.join("\n"))
+        .parse_mode(ParseMode::Html)
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())

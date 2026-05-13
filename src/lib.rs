@@ -7,6 +7,7 @@ pub mod exceptions;
 pub mod imaging;
 pub mod mallard;
 pub mod nixsearch;
+pub mod nixstatus;
 pub mod quote;
 pub mod responses;
 pub mod sessions;
