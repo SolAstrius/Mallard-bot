@@ -1,0 +1,8 @@
+target
+.git
+.github
+**/__pycache__
+*.pyc
+voices
+media
+*.dat

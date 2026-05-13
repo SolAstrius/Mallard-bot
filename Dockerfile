@@ -1,15 +1,30 @@
-FROM python:3.8
+# syntax=docker/dockerfile:1.7
+# ---- builder ------------------------------------------------------------
+FROM rust:1.83-slim-bookworm AS builder
 
-WORKDIR /app
+WORKDIR /build
 
-COPY requirements.txt requirements.txt
-
-RUN apt-get update
-RUN apt install ffmpeg -y
-RUN apt install python3-opencv -y
-#RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-RUN pip3 install -r requirements.txt
+# Pre-cache dependency builds: copy manifests, build a stub, then drop it in.
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && cargo build --release --locked || cargo build --release \
+    && rm -rf src target/release/deps/mallard_bot* target/release/deps/mallard-bot*
 
 COPY . .
+RUN cargo build --release --locked || cargo build --release
 
-CMD [ "python3", "app.py"]
+# ---- runtime ------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /build/target/release/mallard-bot /usr/local/bin/mallard-bot
+COPY content ./content
+
+ENV RUST_LOG=info
+CMD ["mallard-bot"]
