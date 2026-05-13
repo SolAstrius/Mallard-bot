@@ -21,6 +21,8 @@ use crate::imaging::{circular_mask, desired_size, load_bubble};
 
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(75);
 const FFMPEG_BIN: &str = "ffmpeg";
+/// Telegram's hard cap on a video sticker payload.
+const STICKER_BYTES_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoPreprocess {
@@ -262,36 +264,83 @@ pub async fn video_to_sticker(
 
     cmd.arg("-filter_complex")
         .arg(build_filter_graph(&resolved, preprocess))
-        .args(["-c:v", "libvpx-vp9", "-auto-alt-ref", "0"])
-        .args(["-preset", "ultrafast"])
+        // VP9 with alpha for circle output, plain VP9 otherwise.
+        .args(["-c:v", "libvpx-vp9", "-auto-alt-ref", "0"]);
+    if preprocess == VideoPreprocess::Circle {
+        cmd.args(["-pix_fmt", "yuva420p"]);
+    } else {
+        cmd.args(["-pix_fmt", "yuv420p"]);
+    }
+    cmd.args(["-deadline", "good", "-cpu-used", "4", "-row-mt", "1"])
         .args(["-ss", &fmt_ts(resolved.starting_point)]);
     if let Some(end) = resolved.end_point {
         cmd.args(["-to", &fmt_ts(end)]);
     }
     cmd.args(["-s", &format!("{new_w}x{new_h}")])
         .args(["-t", &format!("{:.2}", resolved.final_length)])
-        .arg("-an")
-        .arg(output.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .arg("-an");
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| err_unexpected(format!("spawn ffmpeg: {e}")))?;
-    let output_result = tokio::time::timeout(FFMPEG_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| err_unexpected("ffmpeg timeout"))?
-        .map_err(|e| err_unexpected(format!("ffmpeg wait: {e}")))?;
-    if !output_result.status.success() {
-        return Err(err_unexpected(format!(
-            "ffmpeg: {}",
-            String::from_utf8_lossy(&output_result.stderr)
-        )));
+    // Two-pass strategy: first encode aims for ≈250KB at the configured CRF;
+    // if it overshoots Telegram's 256KB cap we re-run with a tighter cap.
+    let attempts: &[(&str, &str, &str)] = &[
+        // (CRF, max bitrate, buffer)
+        ("32", "550k", "1M"),
+        ("38", "300k", "600k"),
+        ("44", "180k", "360k"),
+    ];
+
+    for (i, (crf, maxrate, bufsize)) in attempts.iter().enumerate() {
+        let mut attempt = clone_cmd(&cmd);
+        // libvpx-vp9 "constrained quality" mode: -b:v must equal the cap when
+        // -maxrate/-bufsize are present (using -b:v 0 here yields a "rate
+        // control parameters set without a bitrate" error from the encoder).
+        attempt
+            .args(["-crf", crf, "-b:v", maxrate])
+            .args(["-maxrate", maxrate, "-bufsize", bufsize])
+            .arg("-y")
+            .arg(output.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let child = attempt
+            .spawn()
+            .map_err(|e| err_unexpected(format!("spawn ffmpeg: {e}")))?;
+        let result = tokio::time::timeout(FFMPEG_TIMEOUT, child.wait_with_output())
+            .await
+            .map_err(|_| err_unexpected("ffmpeg timeout"))?
+            .map_err(|e| err_unexpected(format!("ffmpeg wait: {e}")))?;
+        if !result.status.success() {
+            return Err(err_unexpected(format!(
+                "ffmpeg: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )));
+        }
+
+        let bytes = fs::read(output.path())
+            .await
+            .map_err(|e| err_unexpected(format!("read output: {e}")))?;
+        log::info!(
+            "encode attempt {} (crf={crf} maxrate={maxrate}): {} bytes",
+            i + 1,
+            bytes.len()
+        );
+        if bytes.len() <= STICKER_BYTES_LIMIT || i == attempts.len() - 1 {
+            return Ok(bytes);
+        }
+        log::warn!("output exceeded {STICKER_BYTES_LIMIT}B, retrying with tighter encode");
     }
+    unreachable!()
+}
 
-    fs::read(output.path())
-        .await
-        .map_err(|e| err_unexpected(format!("read output: {e}")))
+fn clone_cmd(src: &Command) -> Command {
+    let mut new = Command::new(src.as_std().get_program());
+    for arg in src.as_std().get_args() {
+        new.arg(arg);
+    }
+    if let Some(dir) = src.as_std().get_current_dir() {
+        new.current_dir(dir);
+    }
+    new
 }
 
 /// Port of `video2emoji` — minimal pass that re-encodes to a 100×100 WebM.
