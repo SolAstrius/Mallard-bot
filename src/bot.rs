@@ -934,24 +934,61 @@ async fn handle_roll(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()>
     let expr = rest.trim();
     let expr = if expr.is_empty() { "1d6" } else { expr };
 
-    let body = match caith::Roller::new(expr) {
+    let (body, as_html) = match caith::Roller::new(expr) {
         Ok(roller) => match roller.roll() {
-            // caith emits its own markdown (backticks for dice values, ** for
-            // selected ones). Strip it — we send as plain text so Telegram
-            // doesn't render the markup, and trying to forward it through
-            // Telegram's MarkdownV2 needs too much escaping.
-            Ok(result) => format!(
-                "\u{1F3B2} {}",
-                result.to_string().replace("**", "").replace('`', "")
+            // caith emits its own markdown (`...` for dice, **...** for the
+            // highlighted ones). Convert to Telegram HTML so the formatting
+            // survives the wire — HTML's escape rules are tame compared to
+            // MarkdownV2's.
+            Ok(result) => (
+                format!("\u{1F3B2} {}", caith_md_to_html(&result.to_string())),
+                true,
             ),
-            Err(e) => format!("не ква, не получилось бросить: {e}"),
+            Err(e) => (format!("не ква, не получилось бросить: {e}"), false),
         },
-        Err(e) => format!("не ква, не понял выражение: {e}"),
+        Err(e) => (format!("не ква, не понял выражение: {e}"), false),
     };
-    bot.send_message(msg.chat.id, body)
-        .reply_parameters(reply_params(msg))
-        .await?;
+    let mut send = bot.send_message(msg.chat.id, body);
+    if as_html {
+        send = send.parse_mode(ParseMode::Html);
+    }
+    send.reply_parameters(reply_params(msg)).await?;
     Ok(())
+}
+
+/// Convert caith's mini-markdown to Telegram HTML.
+/// Supports: `` `code` `` → `<code>…</code>`, `**bold**` → `<b>…</b>`.
+/// Escapes `<`, `>`, `&` so user-supplied substrings (e.g. trailing comments)
+/// can't smuggle markup. Tolerates unclosed runs by closing on EOL/EOS.
+fn caith_md_to_html(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    let mut in_code = false;
+    let mut in_bold = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                out.push_str(if in_code { "</code>" } else { "<code>" });
+                in_code = !in_code;
+            }
+            '*' if chars.peek() == Some(&'*') && !in_code => {
+                chars.next();
+                out.push_str(if in_bold { "</b>" } else { "<b>" });
+                in_bold = !in_bold;
+            }
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            _ => out.push(c),
+        }
+    }
+    if in_code {
+        out.push_str("</code>");
+    }
+    if in_bold {
+        out.push_str("</b>");
+    }
+    out
 }
 
 async fn handle_pick(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
