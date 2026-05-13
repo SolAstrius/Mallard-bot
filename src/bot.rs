@@ -62,6 +62,12 @@ pub enum Command {
     Cha(String),
     #[command(description = "следующая заварка в активной сессии")]
     Sip,
+    #[command(description = "поиск пакета в nixpkgs: /npkg ripgrep")]
+    Npkg(String),
+    #[command(description = "поиск опции NixOS: /nopt services.tailscale")]
+    Nopt(String),
+    #[command(description = "какой пакет даёт эту команду: /nixwhere mtr")]
+    Nixwhere(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -138,6 +144,23 @@ const HELP_HOROSCOPE: &str = "/horoscope даёт прогноз дня для �
 Точность гарантируется в пределах разумного.\n\
 кря-кря.";
 
+const HELP_NPKG: &str = "/npkg <запрос> — поиск пакета в nixpkgs (nixos-unstable).\n\
+Локальный кэш каталога channels.nixos.org, обновляется раз в неделю.\n\
+Возвращает топ-1 совпадение: атрибут, версию, описание, как поставить.\n\
+Например: /npkg ripgrep\n\
+кря-кря.";
+
+const HELP_NOPT: &str = "/nopt <запрос> — поиск опции NixOS.\n\
+Тот же локальный кэш. Возвращает имя, тип, дефолт, описание.\n\
+Например: /nopt services.tailscale.enable\n\
+кря-кря.";
+
+const HELP_NIXWHERE: &str = "/nixwhere <команда> — какой пакет даёт эту бинарь.\n\
+Не идеально: индексирует только mainProgram + имя пакета. \
+Для bash/coreutils и прочих многобинарных — лучше поискать руками.\n\
+Например: /nixwhere mtr\n\
+кря-кря.";
+
 const HELP_CHA: &str = "/cha — чайная сессия.\n\
 Кряква считает заварки и помнит, кто сейчас пьёт чай в этом чате.\n\
 * /cha <название> — начать сессию (название — свободный текст)\n\
@@ -164,6 +187,9 @@ fn help_for(query: &str) -> String {
         "pick" => HELP_PICK.to_string(),
         "horoscope" => HELP_HOROSCOPE.to_string(),
         "cha" | "sip" => HELP_CHA.to_string(),
+        "npkg" => HELP_NPKG.to_string(),
+        "nopt" => HELP_NOPT.to_string(),
+        "nixwhere" => HELP_NIXWHERE.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -310,6 +336,9 @@ async fn handle_command(
         Command::Horoscope => "horoscope".to_string(),
         Command::Cha(r) => format!("cha {r}").trim().to_string(),
         Command::Sip => "sip".to_string(),
+        Command::Npkg(r) => format!("npkg {r}").trim().to_string(),
+        Command::Nopt(r) => format!("nopt {r}").trim().to_string(),
+        Command::Nixwhere(r) => format!("nixwhere {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -336,6 +365,9 @@ async fn handle_command(
         Command::Horoscope => handle_horoscope(&bot, &msg).await,
         Command::Cha(rest) => handle_cha(&bot, &msg, &rest, &config).await,
         Command::Sip => handle_sip(&bot, &msg, &config).await,
+        Command::Npkg(rest) => handle_npkg(&bot, &msg, &rest, &config).await,
+        Command::Nopt(rest) => handle_nopt(&bot, &msg, &rest, &config).await,
+        Command::Nixwhere(rest) => handle_nixwhere(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -1315,4 +1347,207 @@ fn format_unix_short(unix_secs: i64) -> String {
     } else {
         format!("{} дн назад", delta / 86_400)
     }
+}
+
+// ---------- /npkg /nopt /nixwhere — local nixpkgs catalog ----------
+
+async fn handle_npkg(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    let q = rest.trim();
+    if q.is_empty() {
+        bot.send_message(msg.chat.id, "что искать-то? например: /npkg ripgrep")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+    let hits = match config.db.search_nix_packages(q, 3).await {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("npkg query failed: {e}");
+            bot.send_message(msg.chat.id, "не ква, поиск отвалился :(")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    let body = if hits.is_empty() {
+        format!(
+            "ничего не нашлось по «{q}».\n\
+             если каталог только что подгрузился, попробуй ещё раз через минуту."
+        )
+    } else {
+        let top = &hits[0];
+        let descr = if top.description.is_empty() {
+            "(без описания)"
+        } else {
+            top.description.as_str()
+        };
+        let mut lines = vec![format!(
+            "\u{1F4E6} <b>{}</b> · {}",
+            html_escape(&top.attr_name),
+            html_escape(&top.version)
+        )];
+        lines.push(format!("{}", html_escape(descr)));
+        lines.push(format!(
+            "• <code>nix run nixpkgs#{}</code>",
+            html_escape(&top.attr_name)
+        ));
+        lines.push(format!(
+            "• <code>environment.systemPackages = [ pkgs.{} ];</code>",
+            html_escape(&top.attr_name)
+        ));
+        if !top.main_program.is_empty() && top.main_program != top.attr_name {
+            lines.push(format!(
+                "команда: <code>{}</code>",
+                html_escape(&top.main_program)
+            ));
+        }
+        if hits.len() > 1 {
+            let alts: Vec<String> = hits
+                .iter()
+                .skip(1)
+                .take(3)
+                .map(|h| format!("<code>{}</code>", html_escape(&h.attr_name)))
+                .collect();
+            lines.push(format!("ещё: {}", alts.join(", ")));
+        }
+        lines.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
+        .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn handle_nopt(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    let q = rest.trim();
+    if q.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "что искать? например: /nopt services.tailscale.enable",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+    let hits = match config.db.search_nix_options(q, 3).await {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("nopt query failed: {e}");
+            bot.send_message(msg.chat.id, "не ква, поиск отвалился :(")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    let body = if hits.is_empty() {
+        format!("опции «{q}» нет. может, я ещё не подгрузил каталог?")
+    } else {
+        let top = &hits[0];
+        let mut lines = vec![format!(
+            "\u{2699}\u{FE0F} <b>{}</b>",
+            html_escape(&top.name)
+        )];
+        if !top.type_.is_empty() {
+            lines.push(format!("тип: <code>{}</code>", html_escape(&top.type_)));
+        }
+        if !top.default_.is_empty() {
+            lines.push(format!(
+                "по умолчанию: <code>{}</code>",
+                html_escape(&top.default_)
+            ));
+        }
+        if !top.description.is_empty() {
+            let descr = top.description.trim();
+            let shown = if descr.len() > 600 {
+                format!("{}…", &descr[..600])
+            } else {
+                descr.to_string()
+            };
+            lines.push(html_escape(&shown));
+        }
+        if hits.len() > 1 {
+            let alts: Vec<String> = hits
+                .iter()
+                .skip(1)
+                .take(3)
+                .map(|h| format!("<code>{}</code>", html_escape(&h.name)))
+                .collect();
+            lines.push(format!("ещё: {}", alts.join(", ")));
+        }
+        lines.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
+        .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn handle_nixwhere(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    let q = rest.trim();
+    if q.is_empty() {
+        bot.send_message(msg.chat.id, "какую команду искать? например: /nixwhere mtr")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+    let hits = match config.db.search_nix_programs(q, 5).await {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("nixwhere query failed: {e}");
+            bot.send_message(msg.chat.id, "не ква, поиск отвалился :(")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    let body = if hits.is_empty() {
+        format!(
+            "не знаю, какой пакет даёт <code>{}</code>. \n\
+             индекс неполный — у пакета может быть main_program с другим именем.",
+            html_escape(q)
+        )
+    } else {
+        let mut lines = vec![format!("\u{1F50E} <code>{}</code> → ", html_escape(q))];
+        for h in &hits {
+            let suffix = if !h.main_program.is_empty() && h.main_program != q {
+                format!(" (main: <code>{}</code>)", html_escape(&h.main_program))
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "• <code>{}</code>{}",
+                html_escape(&h.attr_name),
+                suffix
+            ));
+        }
+        lines.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
+        .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

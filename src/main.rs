@@ -10,6 +10,7 @@ use teloxide::utils::command::BotCommands as _;
 
 use mallard_bot::bot::{build_dispatcher, BotConfig, Command};
 use mallard_bot::db::Db;
+use mallard_bot::nixsearch;
 use mallard_bot::sessions::{new_store, spawn_reaper};
 use mallard_bot::stickerpack::StickerPack;
 use mallard_bot::Mallard;
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     let tea_sessions = new_store();
     spawn_reaper(tea_sessions.clone(), db.clone());
+    nixsearch::spawn_refresher(db.clone());
 
     let config = BotConfig {
         admin_id,

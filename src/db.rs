@@ -33,6 +33,24 @@ CREATE TABLE IF NOT EXISTS cha_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_cha_chat_ended
     ON cha_sessions(chat_id, ended_at DESC);
+
+-- Nixpkgs / NixOS options local catalog. Populated by a background task
+-- that downloads channels.nixos.org snapshots. FTS5 for query-time search.
+CREATE VIRTUAL TABLE IF NOT EXISTS nix_pkg USING fts5(
+    attr_name, pname, version, description, long_description, main_program,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS nix_opt USING fts5(
+    name, type_, default_, description,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+-- Single-row key/value table for catalog metadata.
+CREATE TABLE IF NOT EXISTS nix_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 #[derive(Debug, Clone)]
@@ -131,4 +149,247 @@ impl Db {
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
+
+    // ---------- nix catalog ----------
+
+    pub async fn nix_meta_get(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare("SELECT value FROM nix_meta WHERE key = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![key])?;
+            if let Some(row) = rows.next()? {
+                Ok::<_, rusqlite::Error>(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn nix_meta_set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO nix_meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Replace the entire nix_pkg table contents in one transaction.
+    pub async fn replace_nix_packages(&self, rows: Vec<NixPkgRow>) -> rusqlite::Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM nix_pkg", [])?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO nix_pkg
+                     (attr_name, pname, version, description, long_description, main_program)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for r in &rows {
+                    stmt.execute(rusqlite::params![
+                        r.attr_name,
+                        r.pname,
+                        r.version,
+                        r.description,
+                        r.long_description,
+                        r.main_program,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok::<_, rusqlite::Error>(rows.len())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Replace the entire nix_opt table contents in one transaction.
+    pub async fn replace_nix_options(&self, rows: Vec<NixOptRow>) -> rusqlite::Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM nix_opt", [])?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO nix_opt (name, type_, default_, description)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for r in &rows {
+                    stmt.execute(rusqlite::params![
+                        r.name,
+                        r.type_,
+                        r.default_,
+                        r.description,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok::<_, rusqlite::Error>(rows.len())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn search_nix_packages(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<NixPkgRow>> {
+        let conn = self.conn.clone();
+        let q = fts_phrase(query);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Rank by FTS5 bm25 — lower is better. Boost exact attr_name
+            // matches by checking equality separately.
+            let mut stmt = conn.prepare(
+                "SELECT attr_name, pname, version, description, long_description, main_program
+                 FROM nix_pkg
+                 WHERE nix_pkg MATCH ?1
+                 ORDER BY bm25(nix_pkg, 12.0, 8.0, 1.0, 1.5, 0.5, 4.0)
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![q, limit], |row| {
+                    Ok(NixPkgRow {
+                        attr_name: row.get(0)?,
+                        pname: row.get(1)?,
+                        version: row.get(2)?,
+                        description: row.get(3)?,
+                        long_description: row.get(4)?,
+                        main_program: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn search_nix_options(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<NixOptRow>> {
+        let conn = self.conn.clone();
+        let q = fts_phrase(query);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT name, type_, default_, description
+                 FROM nix_opt
+                 WHERE nix_opt MATCH ?1
+                 ORDER BY bm25(nix_opt, 8.0, 1.0, 1.0, 2.0)
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![q, limit], |row| {
+                    Ok(NixOptRow {
+                        name: row.get(0)?,
+                        type_: row.get(1)?,
+                        default_: row.get(2)?,
+                        description: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Lookup packages that provide `binary` as their mainProgram, falling
+    /// back to attr_name / pname matches (covers the common "binary == package
+    /// name" case).
+    pub async fn search_nix_programs(
+        &self,
+        binary: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<NixPkgRow>> {
+        let conn = self.conn.clone();
+        let b = binary.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // First exact mainProgram, then attr_name, then pname. Union via
+            // a temporary CTE so we keep the order.
+            let mut stmt = conn.prepare(
+                "SELECT attr_name, pname, version, description, long_description, main_program
+                 FROM nix_pkg
+                 WHERE main_program = ?1
+                    OR attr_name = ?1
+                    OR pname = ?1
+                 ORDER BY (main_program = ?1) DESC, (attr_name = ?1) DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![b, limit], |row| {
+                    Ok(NixPkgRow {
+                        attr_name: row.get(0)?,
+                        pname: row.get(1)?,
+                        version: row.get(2)?,
+                        description: row.get(3)?,
+                        long_description: row.get(4)?,
+                        main_program: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NixPkgRow {
+    pub attr_name: String,
+    pub pname: String,
+    pub version: String,
+    pub description: String,
+    pub long_description: String,
+    pub main_program: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NixOptRow {
+    pub name: String,
+    pub type_: String,
+    pub default_: String,
+    pub description: String,
+}
+
+/// Escape a user query for FTS5 by wrapping each whitespace-split token in
+/// double quotes and joining with AND-implicit space. Suffix wildcard lets
+/// `tail` match `tailscale`.
+fn fts_phrase(q: &str) -> String {
+    q.split_whitespace()
+        .map(|tok| {
+            let cleaned: String = tok
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+                .collect();
+            if cleaned.is_empty() {
+                String::new()
+            } else {
+                format!("\"{cleaned}\"*")
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
