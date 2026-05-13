@@ -57,7 +57,7 @@ spec:
         # first time the pod starts. `cp -rn` (no-clobber) means user-added
         # clips persist across image upgrades.
         - name: seed-voices
-          image: mallard-bot:0199494
+          image: mallard-bot:006d32a
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "cp -rn /app/default-voices/. /app/voices/ || true"]
           volumeMounts:
@@ -65,7 +65,7 @@ spec:
               mountPath: /app/voices
       containers:
         - name: bot
-          image: mallard-bot:0199494
+          image: mallard-bot:006d32a
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:
