@@ -5,21 +5,30 @@ use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
-    InputMessageContentText, MediaKind, MessageKind, ParseMode, ReplyParameters,
+    FileId, InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
+    InputMessageContentText, MediaKind, MessageKind, ParseMode, ReplyParameters, StickerFormat,
+    UserId,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 
-use crate::arguments::{parse_photo_arguments, parse_video_arguments};
+use crate::arguments::{parse_photo_arguments, parse_video_arguments, PhotoQuoteArguments};
+use crate::content::random_emoji;
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
 use crate::imaging::{image_to_emoji, image_to_sticker, FilePreprocessType};
 use crate::mallard::Mallard;
 use crate::quote::render_quote;
 use crate::responses::ResponseType;
+use crate::stickerpack::StickerPack;
 use crate::video::{video_to_emoji, video_to_sticker, VideoPreprocess};
 
 pub type SharedMallard = Arc<Mutex<Mallard>>;
+
+#[derive(Clone)]
+pub struct BotConfig {
+    pub admin_id: Option<UserId>,
+    pub pack: Option<StickerPack>,
+}
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
@@ -30,6 +39,7 @@ pub enum Command {
     Qwa(String),
     Emoji,
     Id,
+    Voice(String),
 }
 
 pub const HELP_TEXT: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -49,9 +59,10 @@ fn reply_params(msg: &Message) -> ReplyParameters {
     ReplyParameters::new(msg.id)
 }
 
-pub async fn build_dispatcher(
+pub fn build_dispatcher(
     bot: Bot,
     mallard: SharedMallard,
+    config: BotConfig,
 ) -> Dispatcher<Bot, anyhow::Error, teloxide::dispatching::DefaultKey> {
     let handler = dptree::entry()
         .branch(
@@ -63,13 +74,13 @@ pub async fn build_dispatcher(
         .branch(Update::filter_inline_query().endpoint(handle_inline));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![mallard])
+        .dependencies(dptree::deps![mallard, config])
         .enable_ctrlc_handler()
         .build()
 }
 
-async fn download_file(bot: &Bot, file_id: &str) -> anyhow::Result<Vec<u8>> {
-    let file = bot.get_file(file_id.to_string()).await?;
+async fn download_file(bot: &Bot, file_id: FileId) -> anyhow::Result<Vec<u8>> {
+    let file = bot.get_file(file_id).await?;
     let mut buf = Vec::with_capacity(file.size as usize);
     bot.download_file(&file.path, &mut buf).await?;
     Ok(buf)
@@ -94,7 +105,7 @@ async fn handle_text(bot: Bot, msg: Message, mallard: SharedMallard) -> anyhow::
                 .await?;
         }
         ResponseType::Sticker => {
-            bot.send_sticker(target, InputFile::file_id(reply_text))
+            bot.send_sticker(target, InputFile::file_id(FileId(reply_text)))
                 .reply_parameters(rp)
                 .await?;
         }
@@ -112,6 +123,7 @@ async fn handle_command(
     bot: Bot,
     msg: Message,
     cmd: Command,
+    config: BotConfig,
     _mallard: SharedMallard,
 ) -> anyhow::Result<()> {
     let result = match cmd {
@@ -122,9 +134,10 @@ async fn handle_command(
             return Ok(());
         }
         Command::Id => handle_id(&bot, &msg).await,
-        Command::Emoji => handle_emoji(&bot, &msg).await,
-        Command::Snap(rest) => handle_snap(&bot, &msg, &rest).await,
-        Command::Qva(rest) | Command::Qwa(rest) => handle_qva(&bot, &msg, &rest).await,
+        Command::Emoji => handle_emoji(&bot, &msg, &config).await,
+        Command::Snap(rest) => handle_snap(&bot, &msg, &rest, &config).await,
+        Command::Qva(rest) | Command::Qwa(rest) => handle_qva(&bot, &msg, &rest, &config).await,
+        Command::Voice(rest) => handle_voice(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -152,7 +165,7 @@ async fn handle_id(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     };
     match reply.sticker() {
         Some(s) => {
-            bot.send_message(msg.chat.id, s.file.id.to_string())
+            bot.send_message(msg.chat.id, s.file.id.0.clone())
                 .reply_parameters(reply_params(msg))
                 .await?;
         }
@@ -168,7 +181,7 @@ async fn handle_id(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_emoji(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
+async fn handle_emoji(bot: &Bot, msg: &Message, _config: &BotConfig) -> anyhow::Result<()> {
     let Some(reply) = msg.reply_to_message() else {
         return Ok(());
     };
@@ -179,7 +192,7 @@ async fn handle_emoji(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
         return Ok(());
     }
     if sticker.is_video() {
-        let bytes = download_file(bot, sticker.file.id.as_str()).await?;
+        let bytes = download_file(bot, sticker.file.id.clone()).await?;
         let out = video_to_emoji(&bytes).await?;
         bot.send_document(
             msg.chat.id,
@@ -192,10 +205,9 @@ async fn handle_emoji(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     let fid = sticker
         .thumbnail
         .as_ref()
-        .map(|t| t.file.id.as_str())
-        .unwrap_or(sticker.file.id.as_str())
-        .to_string();
-    let bytes = download_file(bot, &fid).await?;
+        .map(|t| t.file.id.clone())
+        .unwrap_or_else(|| sticker.file.id.clone());
+    let bytes = download_file(bot, fid).await?;
     let out = image_to_emoji(&bytes)?;
     bot.send_document(
         msg.chat.id,
@@ -206,7 +218,12 @@ async fn handle_emoji(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_snap(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
+async fn handle_snap(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
     let args = parse_photo_arguments(&format!("/snap {rest}"))?;
     let Some(reply) = msg.reply_to_message() else {
         return Err(ProcessingError::of(ProcessingErrorKind::WrongSourceType).into());
@@ -221,6 +238,13 @@ async fn handle_snap(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()>
         )
         .reply_parameters(reply_params(msg))
         .await?;
+    } else if let Some(pack) = config.pack.as_ref() {
+        let sticker = pack
+            .add(bot, png, StickerFormat::Static, random_emoji())
+            .await?;
+        bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+            .reply_parameters(reply_params(msg))
+            .await?;
     } else {
         bot.send_sticker(msg.chat.id, InputFile::memory(png))
             .reply_parameters(reply_params(msg))
@@ -232,7 +256,7 @@ async fn handle_snap(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()>
 async fn render_from_reply(
     bot: &Bot,
     reply: &Message,
-    args: &crate::arguments::PhotoQuoteArguments,
+    args: &PhotoQuoteArguments,
 ) -> Result<Vec<u8>, ProcessingError> {
     let common = match &reply.kind {
         MessageKind::Common(c) => c,
@@ -254,7 +278,7 @@ async fn render_from_reply(
                 .thumbnail
                 .as_ref()
                 .ok_or_else(|| ProcessingError::of(ProcessingErrorKind::WrongSourceType))?;
-            let bytes = download_blocking(bot, &thumb.file.id).await?;
+            let bytes = download_blocking(bot, thumb.file.id.clone()).await?;
             image_to_sticker(&bytes, FilePreprocessType::Circle, args)
         }
         MediaKind::Photo(p) => {
@@ -262,12 +286,12 @@ async fn render_from_reply(
                 .photo
                 .last()
                 .ok_or_else(|| ProcessingError::of(ProcessingErrorKind::WrongSourceType))?;
-            let bytes = download_blocking(bot, &best.file.id).await?;
+            let bytes = download_blocking(bot, best.file.id.clone()).await?;
             image_to_sticker(&bytes, FilePreprocessType::Default, args)
         }
         MediaKind::Document(d) => {
             if let Some(thumb) = &d.document.thumbnail {
-                let bytes = download_blocking(bot, &thumb.file.id).await?;
+                let bytes = download_blocking(bot, thumb.file.id.clone()).await?;
                 return image_to_sticker(&bytes, FilePreprocessType::Default, args);
             }
             if d.document.file.size > 10 * 1024 * 1024 {
@@ -277,7 +301,7 @@ async fn render_from_reply(
         }
         MediaKind::Video(v) => {
             if let Some(thumb) = &v.video.thumbnail {
-                let bytes = download_blocking(bot, &thumb.file.id).await?;
+                let bytes = download_blocking(bot, thumb.file.id.clone()).await?;
                 return image_to_sticker(&bytes, FilePreprocessType::Default, args);
             }
             if v.video.file.size > 10 * 1024 * 1024 {
@@ -289,13 +313,18 @@ async fn render_from_reply(
     }
 }
 
-async fn download_blocking(bot: &Bot, file_id: &str) -> Result<Vec<u8>, ProcessingError> {
+async fn download_blocking(bot: &Bot, file_id: FileId) -> Result<Vec<u8>, ProcessingError> {
     download_file(bot, file_id)
         .await
         .map_err(|e| ProcessingError::new(ProcessingErrorKind::Unexpected, format!("{e}")))
 }
 
-async fn handle_qva(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
+async fn handle_qva(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
     let wait = bot
         .send_message(
             msg.chat.id,
@@ -330,7 +359,7 @@ async fn handle_qva(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> 
             _ => return Err(ProcessingError::of(ProcessingErrorKind::WrongSourceType)),
         };
 
-        let bytes = download_file(bot, &file_id)
+        let bytes = download_file(bot, file_id)
             .await
             .map_err(|e| ProcessingError::new(ProcessingErrorKind::Unexpected, e.to_string()))?;
         let is_emoji = args.is_emoji.unwrap_or(false);
@@ -348,6 +377,13 @@ async fn handle_qva(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> 
                 )
                 .reply_parameters(reply_params(msg))
                 .await?;
+            } else if let Some(pack) = config.pack.as_ref() {
+                let sticker = pack
+                    .add(bot, webm, StickerFormat::Video, random_emoji())
+                    .await?;
+                bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+                    .reply_parameters(reply_params(msg))
+                    .await?;
             } else {
                 bot.send_sticker(msg.chat.id, InputFile::memory(webm))
                     .reply_parameters(reply_params(msg))
@@ -360,6 +396,54 @@ async fn handle_qva(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> 
                 .await?;
         }
     }
+    Ok(())
+}
+
+async fn handle_voice(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    // Admin-only and only meaningful in private chats — same as the Python.
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let Some(admin) = config.admin_id else {
+        return Ok(());
+    };
+    if from.id != admin {
+        return Ok(());
+    }
+    if !matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_)) {
+        return Ok(());
+    }
+    let name = rest.split_whitespace().next().unwrap_or("").trim();
+    if name.is_empty() {
+        bot.send_message(msg.chat.id, "Usage: /voice <name>")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+
+    let Some(reply) = msg.reply_to_message() else {
+        return Ok(());
+    };
+    let voice = match &reply.kind {
+        MessageKind::Common(c) => match &c.media_kind {
+            MediaKind::Voice(v) => &v.voice,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+
+    let bytes = download_file(bot, voice.file.id.clone()).await?;
+    tokio::fs::create_dir_all("voices").await.ok();
+    let path = format!("voices/{name}.ogg");
+    tokio::fs::write(&path, bytes).await?;
+    bot.send_message(msg.chat.id, format!("saved {path}"))
+        .reply_parameters(reply_params(msg))
+        .await?;
     Ok(())
 }
 

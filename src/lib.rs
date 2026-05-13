@@ -1,11 +1,13 @@
 pub mod arguments;
 pub mod bot;
+pub mod content;
 pub mod dictionaries;
 pub mod exceptions;
 pub mod imaging;
 pub mod mallard;
 pub mod quote;
 pub mod responses;
+pub mod stickerpack;
 pub mod video;
 
 pub use arguments::{
