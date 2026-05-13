@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mallard
+---
+# Secret is created out-of-band from the local .env file:
+#   kubectl -n mallard create secret generic mallard-bot-env \
+#     --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -
+# Do NOT commit a Secret manifest with real values to this repo.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mallard-voices
+  namespace: mallard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: openebs-zfs
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mallard-data
+  namespace: mallard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: openebs-zfs
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mallard-bot
+  namespace: mallard
+  labels:
+    app: mallard-bot
+spec:
+  replicas: 1
+  # Telegram getUpdates is a singleton — never run two pods at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mallard-bot
+  template:
+    metadata:
+      labels:
+        app: mallard-bot
+    spec:
+      initContainers:
+        # Seed the persistent voices/ PVC from the image-baked defaults the
+        # first time the pod starts. `cp -rn` (no-clobber) means user-added
+        # clips persist across image upgrades.
+        - name: seed-voices
+          image: mallard-bot:006d32a
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cp -rn /app/default-voices/. /app/voices/ || true"]
+          volumeMounts:
+            - name: voices
+              mountPath: /app/voices
+      containers:
+        - name: bot
+          image: mallard-bot:006d32a
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: mallard-bot-env
+          env:
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: voices
+              mountPath: /app/voices
+            - name: data
+              mountPath: /app/data
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "1500m"
+              memory: "1Gi"
+      volumes:
+        - name: voices
+          persistentVolumeClaim:
+            claimName: mallard-voices
+        - name: data
+          persistentVolumeClaim:
+            claimName: mallard-data

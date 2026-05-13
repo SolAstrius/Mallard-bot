@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python leftovers
+__pycache__/
+*.pyc
+
+# Local Claude sessions
+.claude/
+
+# Local secrets
+.env
