@@ -68,7 +68,7 @@ pub enum Command {
     Nopt(String),
     #[command(description = "какой пакет даёт эту команду: /nixwhere mtr")]
     Nixwhere(String),
-    #[command(hide)]
+    #[command(description = "флаги в чате: /feature, /feature a,b,c on|off|reset (для админов)")]
     Feature(String),
 }
 
@@ -1629,63 +1629,138 @@ async fn is_feature_enabled(config: &BotConfig, chat: ChatId, name: &str) -> boo
     }
 }
 
+/// Bot admin (TG_ADMIN_ID) always allowed; in groups, Telegram chat admins
+/// are also allowed; in private chats, the user IS the chat — allow.
+async fn can_manage_features(bot: &Bot, msg: &Message, config: &BotConfig) -> bool {
+    let Some(from) = msg.from.as_ref() else {
+        return false;
+    };
+    if let Some(admin) = config.admin_id {
+        if from.id == admin {
+            return true;
+        }
+    }
+    if matches!(msg.chat.kind, ChatKind::Private(_)) {
+        return true;
+    }
+    match bot.get_chat_administrators(msg.chat.id).await {
+        Ok(admins) => admins.iter().any(|m| m.user.id == from.id),
+        Err(e) => {
+            log::warn!("get_chat_administrators({}): {e}", msg.chat.id);
+            false
+        }
+    }
+}
+
+/// Parse "a,b c,d  e" / "a b c" into a deduped, KNOWN-validated list.
+/// Returns (known, unknown).
+fn parse_feature_list<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tok in tokens {
+        for raw in tok.split(',') {
+            let name = raw.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if !seen.insert(name) {
+                continue;
+            }
+            // Re-borrow the matching slice to extend lifetime to the
+            // 'static KNOWN_FEATURES table instead of the user input.
+            if let Some(&known_name) = KNOWN_FEATURES.iter().find(|k| **k == name) {
+                known.push(known_name);
+            } else {
+                unknown.push(name);
+            }
+        }
+    }
+    (known, unknown)
+}
+
+#[derive(Clone, Copy)]
+enum FeatureAction {
+    On,
+    Off,
+    Reset,
+}
+
+impl FeatureAction {
+    fn from_token(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" | "enable" => Some(Self::On),
+            "off" | "false" | "no" | "0" | "disable" => Some(Self::Off),
+            "reset" | "default" | "clear" | "unset" => Some(Self::Reset),
+            _ => None,
+        }
+    }
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::On => "включён",
+            Self::Off => "выключен",
+            Self::Reset => "сброшен",
+        }
+    }
+}
+
 async fn handle_feature(
     bot: &Bot,
     msg: &Message,
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    // Admin-only — gated by TG_ADMIN_ID, matching /voice and /import.
-    let Some(from) = msg.from.as_ref() else {
-        return Ok(());
-    };
-    let Some(admin) = config.admin_id else {
-        return Ok(());
-    };
-    if from.id != admin {
-        return Ok(());
-    }
-
     let trimmed = rest.trim();
     let chat = msg.chat.id;
 
+    // Listing is open to everyone — read-only view of the chat's state.
     if trimmed.is_empty() {
-        // List current state for this chat.
         let mut lines = vec![format!("\u{2699}\u{FE0F} флаги в чате {}:", chat.0)];
         for name in KNOWN_FEATURES {
             let on = is_feature_enabled(config, chat, name).await;
-            let src = match config.db.feature_override(chat.0, name).await {
-                Ok(Some(_)) => "явно",
-                _ => "по умолчанию",
-            };
+            let explicit = matches!(config.db.feature_override(chat.0, name).await, Ok(Some(_)));
             let mark = if on { "\u{2705}" } else { "\u{274C}" };
+            let src = if explicit {
+                "явно"
+            } else {
+                "по умолчанию"
+            };
             lines.push(format!("  {mark} {name} ({src})"));
         }
-        lines.push("управление: /feature <имя> on|off|reset".to_string());
+        lines.push("управление (для админов чата): /feature a,b,c on|off|reset".to_string());
         bot.send_message(msg.chat.id, lines.join("\n"))
             .reply_parameters(reply_params(msg))
             .await?;
         return Ok(());
     }
 
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    let (name, action) = match parts.as_slice() {
-        [n, a] => (*n, a.to_lowercase()),
-        _ => {
-            bot.send_message(
-                msg.chat.id,
-                "формат: /feature <имя> on|off|reset (или /feature без аргументов — список)",
-            )
+    // Modification requires admin rights — bot owner OR Telegram chat admin.
+    if !can_manage_features(bot, msg, config).await {
+        bot.send_message(msg.chat.id, "не ква, только админы чата могут это менять.")
             .reply_parameters(reply_params(msg))
             .await?;
-            return Ok(());
-        }
+        return Ok(());
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let Some((last, rest_tokens)) = parts.split_last() else {
+        return Ok(());
     };
-    if !KNOWN_FEATURES.contains(&name) {
+    let Some(action) = FeatureAction::from_token(last) else {
+        bot.send_message(
+            msg.chat.id,
+            "формат: /feature <имена через запятую> on|off|reset",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    };
+    let (features, unknown) = parse_feature_list(rest_tokens);
+    if features.is_empty() && unknown.is_empty() {
         bot.send_message(
             msg.chat.id,
             format!(
-                "не знаю такой флаг: {name}. умею: {}",
+                "перечисли хотя бы один флаг. умею: {}",
                 KNOWN_FEATURES.join(", ")
             ),
         )
@@ -1694,51 +1769,50 @@ async fn handle_feature(
         return Ok(());
     }
 
-    let result = match action.as_str() {
-        "on" | "true" | "yes" | "1" => config
-            .db
-            .feature_set(chat.0, name, true)
-            .await
-            .map(|_| "on"),
-        "off" | "false" | "no" | "0" => config
-            .db
-            .feature_set(chat.0, name, false)
-            .await
-            .map(|_| "off"),
-        "reset" | "default" | "clear" => {
-            config.db.feature_clear(chat.0, name).await.map(|_| "reset")
-        }
-        _ => {
-            bot.send_message(msg.chat.id, "действие: on / off / reset")
-                .reply_parameters(reply_params(msg))
-                .await?;
-            return Ok(());
-        }
-    };
-    match result {
-        Ok(verb) => {
-            let resolved = is_feature_enabled(config, chat, name).await;
-            let mark = if resolved { "\u{2705}" } else { "\u{274C}" };
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "{mark} {name}: {verb} (сейчас {})",
-                    if resolved {
-                        "включён"
-                    } else {
-                        "выключен"
-                    }
-                ),
-            )
-            .reply_parameters(reply_params(msg))
-            .await?;
-        }
-        Err(e) => {
-            log::warn!("feature toggle failed: {e}");
-            bot.send_message(msg.chat.id, "не ква, не получилось :(")
-                .reply_parameters(reply_params(msg))
-                .await?;
+    let mut applied = Vec::new();
+    let mut failed = Vec::new();
+    for name in &features {
+        let res = match action {
+            FeatureAction::On => config.db.feature_set(chat.0, name, true).await,
+            FeatureAction::Off => config.db.feature_set(chat.0, name, false).await,
+            FeatureAction::Reset => config.db.feature_clear(chat.0, name).await,
+        };
+        match res {
+            Ok(()) => applied.push(*name),
+            Err(e) => {
+                log::warn!("feature_set({chat}, {name}): {e}");
+                failed.push(*name);
+            }
         }
     }
+
+    let mut lines = Vec::new();
+    if !applied.is_empty() {
+        let resolved_marks: Vec<String> =
+            futures::future::join_all(applied.iter().map(|n| async move {
+                let on = is_feature_enabled(config, chat, n).await;
+                format!("{} {n}", if on { "\u{2705}" } else { "\u{274C}" })
+            }))
+            .await;
+        lines.push(format!(
+            "{}: {} — сейчас {}",
+            action.verb(),
+            applied.join(", "),
+            resolved_marks.join(", ")
+        ));
+    }
+    if !unknown.is_empty() {
+        lines.push(format!(
+            "пропущено (неизвестные): {}. умею: {}",
+            unknown.join(", "),
+            KNOWN_FEATURES.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        lines.push(format!("ошибка на: {}", failed.join(", ")));
+    }
+    bot.send_message(msg.chat.id, lines.join("\n"))
+        .reply_parameters(reply_params(msg))
+        .await?;
     Ok(())
 }
