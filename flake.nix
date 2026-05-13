@@ -37,8 +37,6 @@
 
           env = {
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
-            # Keep cargo registries / target dir on a fast local path.
-            CARGO_TARGET_DIR = "target";
           };
 
           shellHook = ''
