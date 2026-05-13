@@ -5,7 +5,10 @@ use teloxide::prelude::*;
 use teloxide::types::UserId;
 use tokio::sync::Mutex;
 
-use mallard_bot::bot::{build_dispatcher, BotConfig};
+use teloxide::types::{BotCommandScope, Recipient};
+use teloxide::utils::command::BotCommands as _;
+
+use mallard_bot::bot::{build_dispatcher, BotConfig, Command};
 use mallard_bot::stickerpack::StickerPack;
 use mallard_bot::Mallard;
 
@@ -29,6 +32,30 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("bot has no username"))?;
     log::info!("STARTED as @{bot_username}");
+
+    // Public command list shown in the / menu (hidden variants are skipped).
+    let public_cmds = Command::bot_commands();
+    if let Err(e) = bot.set_my_commands(public_cmds.clone()).await {
+        log::warn!("set_my_commands (default scope) failed: {e}");
+    }
+
+    // Admin sees the full list (including /voice) in their private chat.
+    if let Some(admin) = admin_id {
+        let mut admin_cmds = public_cmds;
+        admin_cmds.push(teloxide::types::BotCommand::new(
+            "voice",
+            "сохранить голосовое в voices/<name>.ogg (только для админа)",
+        ));
+        if let Err(e) = bot
+            .set_my_commands(admin_cmds)
+            .scope(BotCommandScope::Chat {
+                chat_id: Recipient::Id(ChatId(admin.0 as i64)),
+            })
+            .await
+        {
+            log::warn!("set_my_commands (admin scope) failed: {e}");
+        }
+    }
 
     let pack = admin_id.map(|admin| StickerPack {
         admin_user_id: admin,

@@ -1,14 +1,22 @@
 //! Single-pack sticker management (Bot API 7.2+).
 //!
 //! With modern Telegram, one set can mix static / animated / video stickers,
-//! so we keep a single pack `mallard_pack_by_<bot_username>` per bot. The
-//! Python source kept two (image / animated) — the Rust port unifies them.
+//! so we keep one regular pack and one custom-emoji pack per bot:
 //!
-//! Flow:
+//!   * `mallard_pack_by_<bot_username>`        — sticker replies to /snap, /qva
+//!   * `mallard_emoji_pack_by_<bot_username>`  — custom emoji from /snap j, /qva j
+//!
+//! The Python source kept two regular packs (image / animated) and never
+//! built a custom-emoji set at all. The Rust port unifies the regular pack
+//! and adds a custom-emoji pack so `j` results are usable as Premium custom
+//! emoji instead of just being uploaded as documents the user has to feed
+//! through fStikBot.
+//!
+//! Flow per sticker:
 //!   1. Try `addStickerToSet`.
 //!   2. If the set doesn't exist yet, `createNewStickerSet` with this sticker.
-//!   3. Fetch the set, return the freshly-added sticker's `file_id` so the
-//!      caller can reply with a pack-resident sticker (just like the Python).
+//!   3. Fetch the set, return the freshly-added sticker so the caller can
+//!      reply with a pack-resident sticker (just like the Python).
 //!   4. Best-effort prune older stickers down to a small ring buffer.
 
 use teloxide::prelude::*;
@@ -20,10 +28,18 @@ use teloxide::RequestError;
 
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
 
-/// Cap the set so the bot doesn't accumulate forever; Telegram allows up to 120
-/// regular stickers per set.
-const KEEP_LAST: usize = 50;
-const PACK_PREFIX: &str = "mallard_pack";
+/// Cap the regular set so the bot doesn't accumulate forever; Telegram allows
+/// up to 120 regular stickers and up to 200 custom emoji per set.
+const KEEP_LAST_STICKERS: usize = 50;
+const KEEP_LAST_EMOJI: usize = 100;
+const REGULAR_PREFIX: &str = "mallard_pack";
+const EMOJI_PREFIX: &str = "mallard_emoji_pack";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackKind {
+    Regular,
+    CustomEmoji,
+}
 
 #[derive(Debug, Clone)]
 pub struct StickerPack {
@@ -32,12 +48,30 @@ pub struct StickerPack {
 }
 
 impl StickerPack {
-    pub fn pack_name(&self) -> String {
-        format!("{PACK_PREFIX}_by_{}", self.bot_username)
+    fn name_for(&self, kind: PackKind) -> String {
+        let prefix = match kind {
+            PackKind::Regular => REGULAR_PREFIX,
+            PackKind::CustomEmoji => EMOJI_PREFIX,
+        };
+        format!("{prefix}_by_{}", self.bot_username)
     }
 
-    /// Upload `bytes` into the bot's pack and return the resulting pack-resident
-    /// sticker. If the set doesn't exist, create it with this sticker as seed.
+    fn title_for(kind: PackKind) -> &'static str {
+        match kind {
+            PackKind::Regular => "Mallard quotes",
+            PackKind::CustomEmoji => "Mallard custom emoji",
+        }
+    }
+
+    fn keep_last(kind: PackKind) -> usize {
+        match kind {
+            PackKind::Regular => KEEP_LAST_STICKERS,
+            PackKind::CustomEmoji => KEEP_LAST_EMOJI,
+        }
+    }
+
+    /// Upload `bytes` into the bot's regular pack and return the resulting
+    /// pack-resident sticker.
     pub async fn add(
         &self,
         bot: &Bot,
@@ -45,7 +79,32 @@ impl StickerPack {
         format: StickerFormat,
         emoji: &str,
     ) -> Result<Sticker, ProcessingError> {
-        let name = self.pack_name();
+        self.add_to(bot, PackKind::Regular, bytes, format, emoji)
+            .await
+    }
+
+    /// Upload `bytes` into the bot's custom-emoji pack and return the resulting
+    /// custom-emoji sticker (Premium users can use it as a custom emoji).
+    pub async fn add_emoji(
+        &self,
+        bot: &Bot,
+        bytes: Vec<u8>,
+        format: StickerFormat,
+        emoji: &str,
+    ) -> Result<Sticker, ProcessingError> {
+        self.add_to(bot, PackKind::CustomEmoji, bytes, format, emoji)
+            .await
+    }
+
+    async fn add_to(
+        &self,
+        bot: &Bot,
+        kind: PackKind,
+        bytes: Vec<u8>,
+        format: StickerFormat,
+        emoji: &str,
+    ) -> Result<Sticker, ProcessingError> {
+        let name = self.name_for(kind);
         let suffix = match format {
             StickerFormat::Static => "png",
             StickerFormat::Video => "webm",
@@ -65,32 +124,36 @@ impl StickerPack {
             .await;
 
         if let Err(RequestError::Api(ApiError::InvalidStickersSet)) = &add_result {
-            log::info!("creating sticker pack {name}");
+            log::info!("creating sticker pack {name} ({:?})", kind);
+            let sticker_type = match kind {
+                PackKind::Regular => StickerType::Regular,
+                PackKind::CustomEmoji => StickerType::CustomEmoji,
+            };
             bot.create_new_sticker_set(
                 self.admin_user_id,
                 name.clone(),
-                "Mallard quotes".to_string(),
+                Self::title_for(kind).to_string(),
                 [sticker],
             )
-            .sticker_type(StickerType::Regular)
+            .sticker_type(sticker_type)
             .await
             .map_err(|e| {
                 ProcessingError::new(
                     ProcessingErrorKind::Unexpected,
-                    format!("createNewStickerSet: {e}"),
+                    format!("createNewStickerSet ({name}): {e}"),
                 )
             })?;
         } else if let Err(e) = add_result {
             return Err(ProcessingError::new(
                 ProcessingErrorKind::Unexpected,
-                format!("addStickerToSet: {e}"),
+                format!("addStickerToSet ({name}): {e}"),
             ));
         }
 
         let set: StickerSet = bot.get_sticker_set(name.clone()).await.map_err(|e| {
             ProcessingError::new(
                 ProcessingErrorKind::Unexpected,
-                format!("getStickerSet: {e}"),
+                format!("getStickerSet ({name}): {e}"),
             )
         })?;
         let last = set
@@ -99,10 +162,9 @@ impl StickerPack {
             .cloned()
             .ok_or_else(|| ProcessingError::of(ProcessingErrorKind::Unexpected))?;
 
-        // Best-effort prune: keep the most recent KEEP_LAST stickers; ignore
-        // failures because pruning is non-fatal.
-        if set.stickers.len() > KEEP_LAST {
-            let drop = set.stickers.len() - KEEP_LAST;
+        let keep = Self::keep_last(kind);
+        if set.stickers.len() > keep {
+            let drop = set.stickers.len() - keep;
             for s in &set.stickers[..drop] {
                 let _ = bot.delete_sticker_from_set(s.file.id.0.clone()).await;
             }
