@@ -50,6 +50,12 @@ pub enum Command {
     Voice(String),
     #[command(hide)]
     Import(String),
+    #[command(description = "бросить кубик: /roll, /roll 20, /roll 2d6")]
+    Roll(String),
+    #[command(description = "выбрать одно из перечисленного через запятую")]
+    Pick(String),
+    #[command(description = "гороскоп на сегодня для одной из зверушек")]
+    Horoscope,
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -102,6 +108,30 @@ const HELP_IMPORT: &str = "/import <название_пака> переноси�
 сохраняя формат и эмодзи. Долгая операция; кряква отчитается, когда закончит.\n\
 кря-кря.";
 
+const HELP_ROLL: &str = "/roll бросает кубики. Использует полноценный d20-DSL (caith).\n\
+Без аргументов — d6. Поддерживаются модификаторы, advantage, exploding и прочее:\n\
+* /roll 1d20 — обычный бросок\n\
+* /roll 3d6+2 — три шестигранника плюс модификатор\n\
+* /roll 2d20kh1 — advantage (взять наибольший из двух)\n\
+* /roll 2d20kl1 — disadvantage (наименьший)\n\
+* /roll 4d6k3 — keep highest three of four (стандартный stat-rolling)\n\
+* /roll 3d6! — exploding (на максимуме перебрасывает)\n\
+* /roll 3d6r1 — перебросить единицы\n\
+* /roll 4d6t4 — посчитать количество кубиков ≥4\n\
+* /roll 1d20 # save vs death — комментарии после #\n\
+Полная грамматика: https://docs.rs/caith\n\
+кря-кря.";
+
+const HELP_PICK: &str = "/pick выбирает один из перечисленных вариантов.\n\
+Разделитель — запятая, точка с запятой или вертикальная черта.\n\
+Например: /pick чай, кофе, борщ — кряква подумает и выберет один.\n\
+кря-кря.";
+
+const HELP_HOROSCOPE: &str = "/horoscope даёт прогноз дня для случайной зверушки.\n\
+Без аргументов. Использует тот же зверинец, что и инлайн-режим «Кто ты сегодня?».\n\
+Точность гарантируется в пределах разумного.\n\
+кря-кря.";
+
 fn help_for(query: &str) -> String {
     let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
     match q.as_str() {
@@ -112,9 +142,12 @@ fn help_for(query: &str) -> String {
         "id" => HELP_ID.to_string(),
         "voice" => HELP_VOICE.to_string(),
         "import" => HELP_IMPORT.to_string(),
+        "roll" => HELP_ROLL.to_string(),
+        "pick" => HELP_PICK.to_string(),
+        "horoscope" => HELP_HOROSCOPE.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
-             Кряква умеет: /snap, /qva, /emoji, /id."
+             Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
         ),
     }
 }
@@ -253,6 +286,9 @@ async fn handle_command(
         Command::Qwa(r) => format!("qwa {r}").trim().to_string(),
         Command::Voice(r) => format!("voice {r}").trim().to_string(),
         Command::Import(r) => format!("import {r}").trim().to_string(),
+        Command::Roll(r) => format!("roll {r}").trim().to_string(),
+        Command::Pick(r) => format!("pick {r}").trim().to_string(),
+        Command::Horoscope => "horoscope".to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -274,6 +310,9 @@ async fn handle_command(
         Command::Qva(rest) | Command::Qwa(rest) => handle_qva(&bot, &msg, &rest, &config).await,
         Command::Voice(rest) => handle_voice(&bot, &msg, &rest, &config).await,
         Command::Import(rest) => handle_import(&bot, &msg, &rest, &config).await,
+        Command::Roll(rest) => handle_roll(&bot, &msg, &rest).await,
+        Command::Pick(rest) => handle_pick(&bot, &msg, &rest).await,
+        Command::Horoscope => handle_horoscope(&bot, &msg).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -835,6 +874,98 @@ async fn handle_inline(bot: Bot, q: InlineQuery, mallard: SharedMallard) -> anyh
     bot.answer_inline_query(q.id, [InlineQueryResult::Article(result)])
         .cache_time(60 * 60 * 3)
         .is_personal(true)
+        .await?;
+    Ok(())
+}
+
+// ---------- group-chat utilities ----------
+//
+// Pure-text commands accumulated over the years. No external I/O, no
+// permissions — anyone in any chat can use them.
+
+const HOROSCOPE_LINES: &[&str] = &[
+    "ваш день начнётся с открытия, что вы — это вы",
+    "сегодня не доверяйте лисичкам",
+    "ваша сила — в борще",
+    "пельмени принесут удачу после 18:00",
+    "встреча с хомячком изменит ваши планы",
+    "не открывайте письма от мишки, он опять про мёд",
+    "сегодня хороший день, чтобы лечь спать пораньше",
+    "ваш цвет — мятный, ваш напиток — чай",
+    "избегайте квадратов, треугольников и понедельников",
+    "ёжик передаёт привет",
+    "Валера хочет с вами поговорить",
+    "посмотрите в окно — там кто-то есть",
+    "сегодня день обнимашек, лимит — три",
+    "пушистики на вашей стороне",
+    "звёзды говорят: купи себе цветы",
+    "сова видела вас вчера и не одобряет",
+    "сегодня вы притянете к себе одну (1) хорошую вещь",
+    "если что-то идёт не так — это просто пельмени остыли",
+];
+
+async fn handle_roll(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
+    // Full d20-style DSL via caith — supports advantage/disadvantage,
+    // exploding (!), keep/drop (k/d), rerolls (r), targets (t), modifiers,
+    // comments. Examples: "1d20", "2d20kh1+5", "4d6k3", "3d6!", "1d20 # save".
+    let expr = rest.trim();
+    let expr = if expr.is_empty() { "1d6" } else { expr };
+
+    let body = match caith::Roller::new(expr) {
+        Ok(roller) => match roller.roll() {
+            Ok(result) => format!("\u{1F3B2} {result}"),
+            Err(e) => format!("не ква, не получилось бросить: {e}"),
+        },
+        Err(e) => format!("не ква, не понял выражение: {e}"),
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn handle_pick(bot: &Bot, msg: &Message, rest: &str) -> anyhow::Result<()> {
+    use rand::seq::SliceRandom;
+    let options: Vec<&str> = rest
+        .split(|c: char| c == ',' || c == '|' || c == ';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if options.len() < 2 {
+        bot.send_message(
+            msg.chat.id,
+            "перечисли через запятую хотя бы два варианта, например: /pick чай, кофе, борщ",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+    let chosen: String = {
+        let mut rng = rand::thread_rng();
+        options.choose(&mut rng).copied().unwrap_or("").to_string()
+    };
+    bot.send_message(msg.chat.id, format!("\u{1F50D} {chosen}"))
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn handle_horoscope(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
+    use rand::seq::SliceRandom;
+    use crate::dictionaries::CREATURES;
+    let body = {
+        let mut rng = rand::thread_rng();
+        let creature = CREATURES.choose(&mut rng).copied().unwrap_or("Я уточка!");
+        let line = HOROSCOPE_LINES.choose(&mut rng).copied().unwrap_or("кря");
+        let lead = creature
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{lead}\n\n{line}\n\nкря-кря.")
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
 }
