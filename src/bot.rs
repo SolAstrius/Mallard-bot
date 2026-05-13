@@ -20,7 +20,7 @@ use crate::imaging::{image_to_emoji, image_to_sticker, FilePreprocessType};
 use crate::mallard::Mallard;
 use crate::quote::render_quote;
 use crate::responses::ResponseType;
-use crate::stickerpack::StickerPack;
+use crate::stickerpack::{PackKind, StickerPack};
 use crate::video::{video_to_emoji, video_to_sticker, VideoPreprocess};
 
 pub type SharedMallard = Arc<Mutex<Mallard>>;
@@ -48,6 +48,8 @@ pub enum Command {
     Id,
     #[command(hide)]
     Voice(String),
+    #[command(hide)]
+    Import(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -79,7 +81,8 @@ const HELP_QVA: &str = "/qva превращает ответное сообще�
 Каждый параметр можно указать не больше одного раза, длина результата всё равно режется до 2.9 секунд.\n\
 кря-кря.";
 
-const HELP_EMOJI: &str = "/emoji конвертирует стикер в формат, подходящий для кастомных эмодзи (реакций).\n\
+const HELP_EMOJI: &str =
+    "/emoji конвертирует стикер в формат, подходящий для кастомных эмодзи (реакций).\n\
 Используется в ответ на статичный или видео-стикер, только в личке с ботом.\n\
 Бот вернёт готовый файл (.png или .webm) — его можно скормить @fStikBot для своего эмодзи-пака.\n\
 кря-кря.";
@@ -93,6 +96,12 @@ const HELP_VOICE: &str = "/voice <name> сохраняет голосовое с
 Сохранённые файлы потом могут проигрываться кряквой в ответ на ключевые слова.\n\
 кря-кря.";
 
+const HELP_IMPORT: &str = "/import <название_пака> переносит чужой стикер-пак в наш.\n\
+Только для админа. Аргумент — короткое имя из ссылки t.me/addstickers/<имя>.\n\
+Скачивает каждый стикер из источника и кладёт его в mallard_pack_by_<бот>, \
+сохраняя формат и эмодзи. Долгая операция; кряква отчитается, когда закончит.\n\
+кря-кря.";
+
 fn help_for(query: &str) -> String {
     let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
     match q.as_str() {
@@ -102,6 +111,7 @@ fn help_for(query: &str) -> String {
         "emoji" => HELP_EMOJI.to_string(),
         "id" => HELP_ID.to_string(),
         "voice" => HELP_VOICE.to_string(),
+        "import" => HELP_IMPORT.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id."
@@ -242,6 +252,7 @@ async fn handle_command(
         Command::Qva(r) => format!("qva {r}").trim().to_string(),
         Command::Qwa(r) => format!("qwa {r}").trim().to_string(),
         Command::Voice(r) => format!("voice {r}").trim().to_string(),
+        Command::Import(r) => format!("import {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -262,6 +273,7 @@ async fn handle_command(
         Command::Snap(rest) => handle_snap(&bot, &msg, &rest, &config).await,
         Command::Qva(rest) | Command::Qwa(rest) => handle_qva(&bot, &msg, &rest, &config).await,
         Command::Voice(rest) => handle_voice(&bot, &msg, &rest, &config).await,
+        Command::Import(rest) => handle_import(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -508,27 +520,43 @@ async fn handle_qva(
                 if v.video.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                let pp = if force_circle {
+                    VideoPreprocess::Circle
+                } else {
+                    VideoPreprocess::VideoThumb
+                };
                 (v.video.file.id.clone(), pp)
             }
             MediaKind::Animation(a) => {
                 if a.animation.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                let pp = if force_circle {
+                    VideoPreprocess::Circle
+                } else {
+                    VideoPreprocess::VideoThumb
+                };
                 (a.animation.file.id.clone(), pp)
             }
             MediaKind::Document(d) => {
                 if d.document.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                let pp = if force_circle {
+                    VideoPreprocess::Circle
+                } else {
+                    VideoPreprocess::VideoThumb
+                };
                 (d.document.file.id.clone(), pp)
             }
             // Modern Telegram has video stickers — treat them like a video
             // source so /qva on a video sticker round-trips correctly.
             MediaKind::Sticker(s) if s.sticker.is_video() => {
-                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                let pp = if force_circle {
+                    VideoPreprocess::Circle
+                } else {
+                    VideoPreprocess::VideoThumb
+                };
                 (s.sticker.file.id.clone(), pp)
             }
             // Still image source — route through the image pipeline and
@@ -563,21 +591,26 @@ async fn handle_qva(
             .map_err(|e| ProcessingError::new(ProcessingErrorKind::Unexpected, e.to_string()))?;
         let is_emoji = args.is_emoji.unwrap_or(false);
         let webm = video_to_sticker(&bytes, args, preprocess).await?;
-        Ok::<_, ProcessingError>(QvaOutput::Video { bytes: webm, is_emoji })
+        Ok::<_, ProcessingError>(QvaOutput::Video {
+            bytes: webm,
+            is_emoji,
+        })
     }
     .await;
 
     match result {
         Ok(out) => {
             let (bytes, is_emoji, format, ext) = match out {
-                QvaOutput::Video { bytes, is_emoji } => (bytes, is_emoji, StickerFormat::Video, "webm"),
-                QvaOutput::Still { bytes, is_emoji } => (bytes, is_emoji, StickerFormat::Static, "png"),
+                QvaOutput::Video { bytes, is_emoji } => {
+                    (bytes, is_emoji, StickerFormat::Video, "webm")
+                }
+                QvaOutput::Still { bytes, is_emoji } => {
+                    (bytes, is_emoji, StickerFormat::Static, "png")
+                }
             };
             match (is_emoji, config.pack.as_ref()) {
                 (true, Some(pack)) => {
-                    let sticker = pack
-                        .add_emoji(bot, bytes, format, random_emoji())
-                        .await?;
+                    let sticker = pack.add_emoji(bot, bytes, format, random_emoji()).await?;
                     bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
                         .reply_parameters(reply_params(msg))
                         .await?;
@@ -585,15 +618,14 @@ async fn handle_qva(
                 (true, None) => {
                     bot.send_document(
                         msg.chat.id,
-                        InputFile::memory(bytes).file_name(format!("{}.{ext}", uuid::Uuid::new_v4())),
+                        InputFile::memory(bytes)
+                            .file_name(format!("{}.{ext}", uuid::Uuid::new_v4())),
                     )
                     .reply_parameters(reply_params(msg))
                     .await?;
                 }
                 (false, Some(pack)) => {
-                    let sticker = pack
-                        .add(bot, bytes, format, random_emoji())
-                        .await?;
+                    let sticker = pack.add(bot, bytes, format, random_emoji()).await?;
                     bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
                         .reply_parameters(reply_params(msg))
                         .await?;
@@ -663,6 +695,125 @@ async fn handle_voice(
     tokio::fs::write(&path, bytes).await?;
     bot.send_message(msg.chat.id, format!("saved {path}"))
         .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn handle_import(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    // Admin-only.
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let Some(admin) = config.admin_id else {
+        return Ok(());
+    };
+    if from.id != admin {
+        return Ok(());
+    }
+    let Some(pack) = config.pack.as_ref() else {
+        bot.send_message(msg.chat.id, "Не ква, стикер-пак не настроен.")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    };
+
+    let source_name = rest.split_whitespace().next().unwrap_or("").trim();
+    if source_name.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "Не ква, нужно имя пака. Например: /import gigachad_cryakwa_video_stickers_by_fStikBot",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let progress = bot
+        .send_message(msg.chat.id, format!("Кряква берётся за {source_name}…"))
+        .reply_parameters(reply_params(msg))
+        .await?;
+
+    let set = match bot.get_sticker_set(source_name.to_string()).await {
+        Ok(s) => s,
+        Err(e) => {
+            bot.edit_message_text(
+                progress.chat.id,
+                progress.id,
+                format!("Не ква, не нашла пак {source_name:?}: {e}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let total = set.stickers.len();
+    log::info!("import {source_name}: {total} stickers");
+    let _ = bot
+        .edit_message_text(
+            progress.chat.id,
+            progress.id,
+            format!("Нашла {total} стикеров в {source_name}, тащу к себе…"),
+        )
+        .await;
+
+    let mut imported = 0usize;
+    let mut failed = 0usize;
+    for (i, src) in set.stickers.iter().enumerate() {
+        match import_one(bot, pack, src).await {
+            Ok(()) => imported += 1,
+            Err(e) => {
+                failed += 1;
+                log::warn!("import sticker {i}/{total} failed: {e}");
+            }
+        }
+        // Periodic progress + light rate-limit padding.
+        if (i + 1) % 10 == 0 {
+            let _ = bot
+                .edit_message_text(
+                    progress.chat.id,
+                    progress.id,
+                    format!("Кряква тащит: {}/{total}…", i + 1),
+                )
+                .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    let url = pack.pack_url(PackKind::Regular);
+    bot.edit_message_text(
+        progress.chat.id,
+        progress.id,
+        format!("Готово: {imported}/{total} перетащено, {failed} провалилось.\n{url}"),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn import_one(
+    bot: &Bot,
+    pack: &StickerPack,
+    src: &teloxide::types::Sticker,
+) -> anyhow::Result<()> {
+    use teloxide::types::StickerFormat;
+    let bytes = download_file(bot, src.file.id.clone()).await?;
+    let format = if src.is_video() {
+        StickerFormat::Video
+    } else if src.is_animated() {
+        StickerFormat::Animated
+    } else {
+        StickerFormat::Static
+    };
+    let emojis = src
+        .emoji
+        .clone()
+        .map(|e| vec![e])
+        .unwrap_or_else(|| vec![random_emoji().to_string()]);
+    pack.add_to_with_emojis(bot, PackKind::Regular, bytes, format, emojis)
         .await?;
     Ok(())
 }

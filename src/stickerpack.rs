@@ -30,7 +30,7 @@ use crate::exceptions::{ProcessingError, ProcessingErrorKind};
 
 /// Cap the regular set so the bot doesn't accumulate forever; Telegram allows
 /// up to 120 regular stickers and up to 200 custom emoji per set.
-const KEEP_LAST_STICKERS: usize = 50;
+const KEEP_LAST_STICKERS: usize = 100;
 const KEEP_LAST_EMOJI: usize = 100;
 const REGULAR_PREFIX: &str = "mallard_pack";
 const EMOJI_PREFIX: &str = "mallard_emoji_pack";
@@ -96,6 +96,10 @@ impl StickerPack {
             .await
     }
 
+    pub fn pack_url(&self, kind: PackKind) -> String {
+        format!("https://t.me/addstickers/{}", self.name_for(kind))
+    }
+
     async fn add_to(
         &self,
         bot: &Bot,
@@ -104,6 +108,20 @@ impl StickerPack {
         format: StickerFormat,
         emoji: &str,
     ) -> Result<Sticker, ProcessingError> {
+        self.add_to_with_emojis(bot, kind, bytes, format, vec![emoji.to_string()])
+            .await
+    }
+
+    /// Same as `add_to` but lets the caller specify the full emoji list — used
+    /// by `/import` to preserve the source sticker's emoji tags.
+    pub async fn add_to_with_emojis(
+        &self,
+        bot: &Bot,
+        kind: PackKind,
+        bytes: Vec<u8>,
+        format: StickerFormat,
+        emojis: Vec<String>,
+    ) -> Result<Sticker, ProcessingError> {
         let name = self.name_for(kind);
         let suffix = match format {
             StickerFormat::Static => "png",
@@ -111,10 +129,15 @@ impl StickerPack {
             StickerFormat::Animated => "tgs",
         };
         let file = InputFile::memory(bytes).file_name(format!("sticker.{suffix}"));
+        let emoji_list = if emojis.is_empty() {
+            vec!["\u{1F60C}".to_string()]
+        } else {
+            emojis
+        };
         let sticker = InputSticker {
             sticker: file,
             format: format.clone(),
-            emoji_list: vec![emoji.to_string()],
+            emoji_list,
             mask_position: None,
             keywords: vec![],
         };

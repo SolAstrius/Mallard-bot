@@ -21,10 +21,10 @@ impl Mallard {
         if saying.is_empty() {
             return None;
         }
-        if let Some(reply) = self.check_basic_saying(saying) {
-            return Some(reply);
-        }
-        self.generate_random_answer()
+        let reply = self
+            .check_basic_saying(saying)
+            .or_else(|| self.generate_random_answer())?;
+        Some(maybe_scream(reply))
     }
 
     fn check_basic_saying(&self, saying: &str) -> Option<(String, ResponseType)> {
@@ -75,4 +75,36 @@ impl Mallard {
         let r = &RANDOM_RESPONSES[rng.gen_range(0..RANDOM_RESPONSES.len())];
         Some((r.text.clone(), r.response_type))
     }
+}
+
+/// 1-in-300: the duck briefly loses it. Text replies only — uppercases the
+/// whole thing, stretches the final letter, slaps on "!!!".
+fn maybe_scream((text, ty): (String, ResponseType)) -> (String, ResponseType) {
+    if ty != ResponseType::Text {
+        return (text, ty);
+    }
+    let mut rng = rand::thread_rng();
+    if rng.gen_range(0..300) != 0 {
+        return (text, ty);
+    }
+    (scream(&text, &mut rng), ty)
+}
+
+fn scream(text: &str, rng: &mut impl Rng) -> String {
+    let upper = text.to_uppercase();
+    let chars: Vec<char> = upper.chars().collect();
+    let last_alpha = chars.iter().rposition(|c| c.is_alphabetic());
+    let stretched = match last_alpha {
+        Some(idx) => {
+            let extra = rng.gen_range(6..12);
+            let mut out: String = chars[..=idx].iter().collect();
+            for _ in 0..extra {
+                out.push(chars[idx]);
+            }
+            out.extend(chars[idx + 1..].iter());
+            out
+        }
+        None => upper,
+    };
+    format!("{stretched}!!!")
 }

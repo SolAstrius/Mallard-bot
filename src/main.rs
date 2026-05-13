@@ -46,6 +46,10 @@ async fn main() -> anyhow::Result<()> {
             "voice",
             "сохранить голосовое в voices/<name>.ogg (только для админа)",
         ));
+        admin_cmds.push(teloxide::types::BotCommand::new(
+            "import",
+            "перетащить чужой стикер-пак к себе (только для админа)",
+        ));
         if let Err(e) = bot
             .set_my_commands(admin_cmds)
             .scope(BotCommandScope::Chat {
