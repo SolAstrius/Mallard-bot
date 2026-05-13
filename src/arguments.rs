@@ -22,6 +22,7 @@ pub struct VideoQuoteArguments {
     pub reverse: Option<bool>,
     pub speech_bubble: Option<usize>,
     pub is_emoji: Option<bool>,
+    pub circle: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -79,6 +80,7 @@ pub fn parse_video_arguments(line: &str) -> Result<VideoQuoteArguments, Processi
     let mut seen_b = 0u32;
     let mut seen_r = 0u32;
     let mut seen_j = 0u32;
+    let mut seen_c = 0u32;
 
     let mut words = line.split_whitespace();
     let _ = words.next(); // drop the command itself
@@ -132,6 +134,14 @@ pub fn parse_video_arguments(line: &str) -> Result<VideoQuoteArguments, Processi
                 ));
             }
             result.is_emoji = Some(true);
+        } else if word == "c" {
+            seen_c += 1;
+            if seen_c > 1 {
+                return Err(err_args(
+                    "Несколько вхождений аргумента 'c*', не знаю, что делать :(",
+                ));
+            }
+            result.circle = Some(true);
         } else {
             return Err(err_args(format!(
                 "\"{}\" не подходит как аргумент для команды.",

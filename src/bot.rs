@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use rand::Rng;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    FileId, InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
-    InputMessageContentText, MediaKind, MessageKind, ParseMode, ReplyParameters, StickerFormat,
-    UserId,
+    ChatKind, FileId, InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
+    InputMessageContentText, MediaKind, MessageKind, MessageOrigin, ParseMode, ReplyParameters,
+    StickerFormat, UserId,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
@@ -33,27 +34,80 @@ pub struct BotConfig {
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 pub enum Command {
-    Help,
+    #[command(description = "/help [команда] — справка (общая или по конкретной команде)")]
+    Help(String),
+    #[command(description = "сделать стикер из ответа (картинка/гифка/видео/текст)")]
     Snap(String),
+    #[command(description = "сделать анимированный стикер из ответа (видео/гифка/кружок)")]
     Qva(String),
+    #[command(hide)]
     Qwa(String),
+    #[command(description = "конвертировать стикер в формат кастомного эмодзи")]
     Emoji,
+    #[command(description = "узнать file_id стикера в ответе")]
     Id,
+    #[command(hide)]
     Voice(String),
 }
 
-pub const HELP_TEXT: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
+const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
 Используйте /qva для анимированных стикеров и /snap для обычных.\n\
 Используйте /emoji в ответ на стикер, чтобы преобразовать его в формат, подходящий для кастомных эмодзи (реакций).\n\
+Используйте /id в ответ на стикер, чтобы узнать его file_id.\n\
+Подробности по конкретной команде: /help <команда>, например /help qva.\n\
+кря-кря.";
+
+const HELP_SNAP: &str = "/snap превращает ответное сообщение в стикер.\n\
+В ответ на картинку, гифку, видео, кружок или текстовую цитату.\n\
+При использовании /snap вы также можете использовать параметры:\n\
+* b<id> — добавляет пузырёк, 1 — справа, 2 — сверху, без числа — случайный\n\
+* j — если указан, преобразует результат в формат, подходящий для кастомных эмодзи (100×100)\n\
+* например /snap b1 добавит пузырёк справа.\n\
+кря-кря.";
+
+const HELP_QVA: &str = "/qva превращает ответное сообщение в анимированный стикер.\n\
+В ответ на видео, гифку, кружок или видео-стикер (до 10 МБ). Если ответить на картинку, бот вернёт обычный (статичный) стикер — параметры s/e/x/r при этом ничего не делают.\n\
 При использовании /qva вы также можете использовать параметры:\n\
 * s<sec> обрежет видео начиная с sec, sec должно быть целым\n\
-* e<sec> обрежет видео до sec, sec должно быть целым\n\
+* e<sec> обрежет видео до sec, sec должно быть целым (используется только вместе с s<sec>)\n\
 * x<speed> изменит скорость видео на speed, speed может иметь вид 123.123\n\
 * r — если указан, видео будет инвертировано\n\
-* b<id> — добавляет пузырёк, 1 — справа, 2 — сверху\n\
-* j — если указан, преобразует видео/фото в формат, подходящий для кастомных эмодзи\n\
-* например /qva s5 e7 x2.5 r обрежет видео с 5 по 7 секунды, инвертирует полученный фрагмент и ускорит его в два с половиной раза\n\
+* c — если указан, результат будет круглым (как кружок); для кружка применяется автоматически\n\
+* b<id> — добавляет пузырёк, 1 — справа, 2 — сверху, без числа — случайный\n\
+* j — если указан, преобразует результат в формат, подходящий для кастомных эмодзи (100×100)\n\
+* например /qva s5 e7 x2.5 r обрежет видео с 5 по 7 секунды, инвертирует полученный фрагмент и ускорит его в два с половиной раза.\n\
+Каждый параметр можно указать не больше одного раза, длина результата всё равно режется до 2.9 секунд.\n\
 кря-кря.";
+
+const HELP_EMOJI: &str = "/emoji конвертирует стикер в формат, подходящий для кастомных эмодзи (реакций).\n\
+Используется в ответ на статичный или видео-стикер, только в личке с ботом.\n\
+Бот вернёт готовый файл (.png или .webm) — его можно скормить @fStikBot для своего эмодзи-пака.\n\
+кря-кря.";
+
+const HELP_ID: &str = "/id показывает file_id стикера.\n\
+Используется в ответ на стикер. Бот пришлёт его внутренний идентификатор.\n\
+кря-кря.";
+
+const HELP_VOICE: &str = "/voice <name> сохраняет голосовое сообщение в voices/<name>.ogg.\n\
+Только для админа, только в личке, в ответ на голосовое сообщение.\n\
+Сохранённые файлы потом могут проигрываться кряквой в ответ на ключевые слова.\n\
+кря-кря.";
+
+fn help_for(query: &str) -> String {
+    let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
+    match q.as_str() {
+        "" | "help" => HELP_OVERVIEW.to_string(),
+        "snap" => HELP_SNAP.to_string(),
+        "qva" | "qwa" => HELP_QVA.to_string(),
+        "emoji" => HELP_EMOJI.to_string(),
+        "id" => HELP_ID.to_string(),
+        "voice" => HELP_VOICE.to_string(),
+        other => format!(
+            "Не ква, не знаю такой команды ({other:?}). \
+             Кряква умеет: /snap, /qva, /emoji, /id."
+        ),
+    }
+}
 
 fn reply_params(msg: &Message) -> ReplyParameters {
     ReplyParameters::new(msg.id)
@@ -71,12 +125,59 @@ pub fn build_dispatcher(
                 .endpoint(handle_command),
         )
         .branch(Update::filter_message().endpoint(handle_text))
-        .branch(Update::filter_inline_query().endpoint(handle_inline));
+        .branch(Update::filter_inline_query().endpoint(handle_inline))
+        // Swallow membership / chat-admin updates so they don't log as
+        // "unhandled". Nothing to do for them.
+        .branch(Update::filter_my_chat_member().endpoint(noop_chat_member))
+        .branch(Update::filter_chat_member().endpoint(noop_chat_member));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![mallard, config])
+        .default_handler(|_| async {})
         .enable_ctrlc_handler()
         .build()
+}
+
+async fn noop_chat_member(_: teloxide::types::ChatMemberUpdated) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn origin(msg: &Message) -> String {
+    let user = msg
+        .from
+        .as_ref()
+        .map(|u| {
+            u.username
+                .as_ref()
+                .map(|n| format!("@{n}"))
+                .unwrap_or_else(|| u.full_name())
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let chat = match &msg.chat.kind {
+        teloxide::types::ChatKind::Private(_) => "private".to_string(),
+        teloxide::types::ChatKind::Public(p) => p
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("chat:{}", msg.chat.id.0)),
+    };
+    format!("{user}@{chat}")
+}
+
+fn describe_media(reply: &Message) -> &'static str {
+    match &reply.kind {
+        MessageKind::Common(c) => match &c.media_kind {
+            MediaKind::Text(_) => "text",
+            MediaKind::Photo(_) => "photo",
+            MediaKind::Video(_) => "video",
+            MediaKind::VideoNote(_) => "video_note",
+            MediaKind::Document(_) => "document",
+            MediaKind::Animation(_) => "animation",
+            MediaKind::Voice(_) => "voice",
+            MediaKind::Sticker(_) => "sticker",
+            _ => "other",
+        },
+        _ => "non-common",
+    }
 }
 
 async fn download_file(bot: &Bot, file_id: FileId) -> anyhow::Result<Vec<u8>> {
@@ -96,6 +197,13 @@ async fn handle_text(bot: Bot, msg: Message, mallard: SharedMallard) -> anyhow::
     let Some((reply_text, reply_type)) = reply else {
         return Ok(());
     };
+    log::info!(
+        "echo from {}: {:?} → {:?} {:.40?}",
+        origin(&msg),
+        text,
+        reply_type,
+        reply_text
+    );
     let target = msg.chat.id;
     let rp = reply_params(&msg);
     match reply_type {
@@ -126,9 +234,25 @@ async fn handle_command(
     config: BotConfig,
     _mallard: SharedMallard,
 ) -> anyhow::Result<()> {
+    let cmd_label = match &cmd {
+        Command::Help(r) => format!("help {r}").trim().to_string(),
+        Command::Id => "id".to_string(),
+        Command::Emoji => "emoji".to_string(),
+        Command::Snap(r) => format!("snap {r}").trim().to_string(),
+        Command::Qva(r) => format!("qva {r}").trim().to_string(),
+        Command::Qwa(r) => format!("qwa {r}").trim().to_string(),
+        Command::Voice(r) => format!("voice {r}").trim().to_string(),
+    };
+    let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
+    log::info!(
+        "cmd /{} from {} (reply_to: {})",
+        cmd_label,
+        origin(&msg),
+        reply_kind
+    );
     let result = match cmd {
-        Command::Help => {
-            bot.send_message(msg.chat.id, HELP_TEXT)
+        Command::Help(query) => {
+            bot.send_message(msg.chat.id, help_for(&query))
                 .reply_parameters(reply_params(&msg))
                 .await?;
             return Ok(());
@@ -182,6 +306,10 @@ async fn handle_id(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
 }
 
 async fn handle_emoji(bot: &Bot, msg: &Message, _config: &BotConfig) -> anyhow::Result<()> {
+    // Python only runs /emoji in private chats — keep the same restriction.
+    if !matches!(msg.chat.kind, ChatKind::Private(_)) {
+        return Ok(());
+    }
     let Some(reply) = msg.reply_to_message() else {
         return Ok(());
     };
@@ -230,27 +358,60 @@ async fn handle_snap(
     };
 
     let png = render_from_reply(bot, reply, &args).await?;
+    let is_emoji = args.is_emoji.unwrap_or(false);
 
-    if args.is_emoji.unwrap_or(false) {
-        bot.send_document(
-            msg.chat.id,
-            InputFile::memory(png).file_name(format!("{}.png", uuid::Uuid::new_v4())),
-        )
-        .reply_parameters(reply_params(msg))
-        .await?;
-    } else if let Some(pack) = config.pack.as_ref() {
-        let sticker = pack
-            .add(bot, png, StickerFormat::Static, random_emoji())
-            .await?;
-        bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+    match (is_emoji, config.pack.as_ref()) {
+        (true, Some(pack)) => {
+            let sticker = pack
+                .add_emoji(bot, png, StickerFormat::Static, random_emoji())
+                .await?;
+            bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+        (true, None) => {
+            bot.send_document(
+                msg.chat.id,
+                InputFile::memory(png).file_name(format!("{}.png", uuid::Uuid::new_v4())),
+            )
             .reply_parameters(reply_params(msg))
             .await?;
-    } else {
-        bot.send_sticker(msg.chat.id, InputFile::memory(png))
-            .reply_parameters(reply_params(msg))
-            .await?;
+        }
+        (false, Some(pack)) => {
+            let sticker = pack
+                .add(bot, png, StickerFormat::Static, random_emoji())
+                .await?;
+            bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+        (false, None) => {
+            bot.send_sticker(msg.chat.id, InputFile::memory(png))
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
     }
     Ok(())
+}
+
+/// Author cascade for /snap-on-text quotes — matches the Python behaviour:
+/// hidden-user forwards win, then visible-user forwards, then the message
+/// sender, then a hard-coded fallback.
+fn quote_author(reply: &Message) -> String {
+    if let Some(MessageOrigin::HiddenUser {
+        sender_user_name, ..
+    }) = reply.forward_origin()
+    {
+        return sender_user_name.clone();
+    }
+    if let Some(u) = reply.forward_from_user() {
+        return u.full_name();
+    }
+    reply
+        .from
+        .as_ref()
+        .map(|u| u.full_name())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 async fn render_from_reply(
@@ -265,12 +426,10 @@ async fn render_from_reply(
 
     match &common.media_kind {
         MediaKind::Text(t) => {
-            let author = reply
-                .forward_from_user()
-                .map(|u| u.full_name())
-                .or_else(|| reply.from.as_ref().map(|u| u.full_name()))
-                .unwrap_or_else(|| "unknown".to_string());
-            render_quote(&t.text, &author, 0)
+            let author = quote_author(reply);
+            // Python picks one of 4 palette colours per quote at random.
+            let color_index = rand::thread_rng().gen_range(0..4);
+            render_quote(&t.text, &author, color_index)
         }
         MediaKind::VideoNote(vn) => {
             let thumb = vn
@@ -342,19 +501,59 @@ async fn handle_qva(
             MessageKind::Common(c) => c,
             _ => return Err(ProcessingError::of(ProcessingErrorKind::WrongSourceType)),
         };
+        let force_circle = args.circle.unwrap_or(false);
         let (file_id, preprocess) = match &common.media_kind {
             MediaKind::VideoNote(v) => (v.video_note.file.id.clone(), VideoPreprocess::Circle),
             MediaKind::Video(v) => {
                 if v.video.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                (v.video.file.id.clone(), VideoPreprocess::VideoThumb)
+                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                (v.video.file.id.clone(), pp)
+            }
+            MediaKind::Animation(a) => {
+                if a.animation.file.size > 10 * 1024 * 1024 {
+                    return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
+                }
+                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                (a.animation.file.id.clone(), pp)
             }
             MediaKind::Document(d) => {
                 if d.document.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                (d.document.file.id.clone(), VideoPreprocess::VideoThumb)
+                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                (d.document.file.id.clone(), pp)
+            }
+            // Modern Telegram has video stickers — treat them like a video
+            // source so /qva on a video sticker round-trips correctly.
+            MediaKind::Sticker(s) if s.sticker.is_video() => {
+                let pp = if force_circle { VideoPreprocess::Circle } else { VideoPreprocess::VideoThumb };
+                (s.sticker.file.id.clone(), pp)
+            }
+            // Still image source — route through the image pipeline and
+            // return a static sticker. Animation-only flags (s/e/x/r) have
+            // no meaning on a single frame and are silently ignored.
+            MediaKind::Photo(p) => {
+                let best = p
+                    .photo
+                    .last()
+                    .ok_or_else(|| ProcessingError::of(ProcessingErrorKind::WrongSourceType))?;
+                let bytes = download_blocking(bot, best.file.id.clone()).await?;
+                let photo_args = PhotoQuoteArguments {
+                    speech_bubble: args.speech_bubble,
+                    is_emoji: args.is_emoji,
+                };
+                let preprocess = if force_circle {
+                    FilePreprocessType::Circle
+                } else {
+                    FilePreprocessType::Default
+                };
+                let png = image_to_sticker(&bytes, preprocess, &photo_args)?;
+                return Ok::<_, ProcessingError>(QvaOutput::Still {
+                    bytes: png,
+                    is_emoji: args.is_emoji.unwrap_or(false),
+                });
             }
             _ => return Err(ProcessingError::of(ProcessingErrorKind::WrongSourceType)),
         };
@@ -364,30 +563,46 @@ async fn handle_qva(
             .map_err(|e| ProcessingError::new(ProcessingErrorKind::Unexpected, e.to_string()))?;
         let is_emoji = args.is_emoji.unwrap_or(false);
         let webm = video_to_sticker(&bytes, args, preprocess).await?;
-        Ok::<_, ProcessingError>((webm, is_emoji))
+        Ok::<_, ProcessingError>(QvaOutput::Video { bytes: webm, is_emoji })
     }
     .await;
 
     match result {
-        Ok((webm, is_emoji)) => {
-            if is_emoji {
-                bot.send_document(
-                    msg.chat.id,
-                    InputFile::memory(webm).file_name(format!("{}.webm", uuid::Uuid::new_v4())),
-                )
-                .reply_parameters(reply_params(msg))
-                .await?;
-            } else if let Some(pack) = config.pack.as_ref() {
-                let sticker = pack
-                    .add(bot, webm, StickerFormat::Video, random_emoji())
-                    .await?;
-                bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+        Ok(out) => {
+            let (bytes, is_emoji, format, ext) = match out {
+                QvaOutput::Video { bytes, is_emoji } => (bytes, is_emoji, StickerFormat::Video, "webm"),
+                QvaOutput::Still { bytes, is_emoji } => (bytes, is_emoji, StickerFormat::Static, "png"),
+            };
+            match (is_emoji, config.pack.as_ref()) {
+                (true, Some(pack)) => {
+                    let sticker = pack
+                        .add_emoji(bot, bytes, format, random_emoji())
+                        .await?;
+                    bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+                        .reply_parameters(reply_params(msg))
+                        .await?;
+                }
+                (true, None) => {
+                    bot.send_document(
+                        msg.chat.id,
+                        InputFile::memory(bytes).file_name(format!("{}.{ext}", uuid::Uuid::new_v4())),
+                    )
                     .reply_parameters(reply_params(msg))
                     .await?;
-            } else {
-                bot.send_sticker(msg.chat.id, InputFile::memory(webm))
-                    .reply_parameters(reply_params(msg))
-                    .await?;
+                }
+                (false, Some(pack)) => {
+                    let sticker = pack
+                        .add(bot, bytes, format, random_emoji())
+                        .await?;
+                    bot.send_sticker(msg.chat.id, InputFile::file_id(sticker.file.id))
+                        .reply_parameters(reply_params(msg))
+                        .await?;
+                }
+                (false, None) => {
+                    bot.send_sticker(msg.chat.id, InputFile::memory(bytes))
+                        .reply_parameters(reply_params(msg))
+                        .await?;
+                }
             }
             bot.delete_message(wait.chat.id, wait.id).await.ok();
         }
@@ -397,6 +612,11 @@ async fn handle_qva(
         }
     }
     Ok(())
+}
+
+enum QvaOutput {
+    Video { bytes: Vec<u8>, is_emoji: bool },
+    Still { bytes: Vec<u8>, is_emoji: bool },
 }
 
 async fn handle_voice(
@@ -449,6 +669,11 @@ async fn handle_voice(
 
 async fn handle_inline(bot: Bot, q: InlineQuery, mallard: SharedMallard) -> anyhow::Result<()> {
     let creature = { mallard.lock().await.get_creature().to_string() };
+    log::info!(
+        "inline from @{}: {:?} → {creature}",
+        q.from.username.as_deref().unwrap_or("?"),
+        q.query
+    );
     let result = InlineQueryResultArticle::new(
         uuid::Uuid::new_v4().to_string(),
         "Кто ты сегодня?",
