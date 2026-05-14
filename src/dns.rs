@@ -14,7 +14,6 @@
 //! through `dns.resolvers.<name>` feature flags. Custom `@resolver` (an IP
 //! or hostname) bypasses the pool entirely.
 
-use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -458,10 +457,12 @@ async fn cmd_prop(tokens: &[&str], rules: &[(String, String)]) -> String {
     });
     let results = futures::future::join_all(queries).await;
 
-    // Group rows by stringified value-set per resolver, so the table can
-    // flag divergence by highlighting rows whose answer set is unique.
-    let mut sets: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    for (label, _ip, q) in &results {
+    // Group resolvers by the normalized answer set. We need the order of
+    // appearance later for stable cohort assignment, so use Vec instead of
+    // BTreeMap.
+    let mut cohort_keys: Vec<String> = Vec::new();
+    let mut cohort_members: Vec<Vec<usize>> = Vec::new(); // indices into `results`
+    for (i, (_label, _ip, q)) in results.iter().enumerate() {
         let mut vals: Vec<String> = q.rows.iter().map(|r| r.value.clone()).collect();
         vals.sort();
         let key = if let Some(err) = &q.error {
@@ -471,35 +472,70 @@ async fn cmd_prop(tokens: &[&str], rules: &[(String, String)]) -> String {
         } else {
             vals.join(",")
         };
-        sets.entry(key).or_default().push(label);
+        match cohort_keys.iter().position(|k| k == &key) {
+            Some(idx) => cohort_members[idx].push(i),
+            None => {
+                cohort_keys.push(key);
+                cohort_members.push(vec![i]);
+            }
+        }
     }
-    let unanimous = sets.len() == 1;
 
+    // Reorder cohorts so the largest comes first (= "A"). Ties broken by
+    // first appearance to keep results stable across runs.
+    let mut order: Vec<usize> = (0..cohort_keys.len()).collect();
+    order.sort_by(|a, b| cohort_members[*b].len().cmp(&cohort_members[*a].len()));
+    // Build resolver_index → cohort_letter
+    let mut resolver_letter: Vec<char> = vec![' '; results.len()];
+    for (rank, cohort_idx) in order.iter().enumerate() {
+        let letter = char::from(b'A' + rank as u8);
+        for &res_idx in &cohort_members[*cohort_idx] {
+            resolver_letter[res_idx] = letter;
+        }
+    }
+
+    let unanimous = cohort_keys.len() == 1;
     let show_rtt = features::parse_bool(&features::resolve(rules, "dns.show_rtt").0)
         .unwrap_or(true);
+
     let mut out = format!("; {} {} — пропагация\n", name, rtype);
     if unanimous {
         out.push_str("; все резолверы согласны ✅\n");
     } else {
-        out.push_str(&format!("; расхождение: {} разных ответа ⚠️\n", sets.len()));
+        // Header lines summarize cohort sizes, e.g. "A=3 B=2 C=1".
+        let summary: Vec<String> = order
+            .iter()
+            .enumerate()
+            .map(|(rank, cohort_idx)| {
+                let letter = char::from(b'A' + rank as u8);
+                format!("{}={}", letter, cohort_members[*cohort_idx].len())
+            })
+            .collect();
+        out.push_str(&format!(
+            "; {} групп ответов: {} ⚠️\n",
+            cohort_keys.len(),
+            summary.join(" ")
+        ));
     }
-    for (label, ip, q) in &results {
+
+    for (i, (label, ip, q)) in results.iter().enumerate() {
+        let letter = resolver_letter[i];
         let badge = if q.error.is_some() {
-            "❌"
+            "❌".to_string()
         } else if unanimous {
-            "✅"
+            "✅".to_string()
+        } else if letter == 'A' {
+            // Majority cohort — green tick to anchor the eye.
+            format!("[{letter}] ✅")
         } else {
-            "⚠️"
+            format!("[{letter}] ⚠️")
         };
         let rtt_str = if show_rtt {
             format!("{:>4}ms", q.rtt.as_millis())
         } else {
             String::new()
         };
-        out.push_str(&format!(
-            "{badge} {:<11} {:<15} {}",
-            label, ip, rtt_str
-        ));
+        out.push_str(&format!("{badge} {:<11} {:<15} {}", label, ip, rtt_str));
         if let Some(err) = &q.error {
             out.push_str(&format!("   {err}\n"));
             continue;
