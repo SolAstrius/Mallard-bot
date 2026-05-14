@@ -6,9 +6,10 @@ use rand::Rng;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatKind, FileId, InlineQueryResult, InlineQueryResultArticle, InputFile, InputMedia,
-    InputMediaPhoto, InputMessageContent, InputMessageContentText, MediaKind, MessageKind,
-    MessageOrigin, ParseMode, ReplyParameters, StickerFormat, UserId,
+    ChatId, ChatKind, FileId, InlineQueryResult, InlineQueryResultArticle,
+    InlineQueryResultCachedPhoto, InputFile, InputMedia, InputMediaPhoto, InputMessageContent,
+    InputMessageContentText, MediaKind, MessageKind, MessageOrigin, ParseMode, ReplyParameters,
+    StickerFormat, UserId,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
@@ -212,6 +213,9 @@ const HELP_INLINE: &str = "/inline — переключить расширенн
 * @<бот> roll 2d6 — кубики\n\
 * @<бот> pick чай, кофе, борщ — выбор из списка\n\
 * @<бот> horoscope — гороскоп\n\
+* @<бот> typst x^2 + 1 — отрендеренная картинка\n\
+* @<бот> latex \\frac{1}{2} — то же через mitex\n\
+* @<бот> math <код> — кряква сама поймёт диалект\n\
 * @<бот> creature — зверушка дня\n\
 /inline ещё раз — выключить обратно.\n\
 кря-кря.";
@@ -1086,13 +1090,18 @@ async fn handle_inline(
         "roll" | "r" | "/roll" => inline_roll(rest),
         "pick" | "p" | "/pick" => inline_pick(rest),
         "horoscope" | "h" | "/horoscope" => inline_horoscope(),
+        "typst" | "/typst" => inline_render(&bot, &config, rest, MathRoute::Typst).await,
+        "latex" | "tex" | "/latex" | "/tex" => {
+            inline_render(&bot, &config, rest, MathRoute::Latex).await
+        }
+        "math" | "/math" => inline_render(&bot, &config, rest, MathRoute::Auto).await,
         "creature" | "ква" | "/creature" => {
             let creature = { mallard.lock().await.get_creature().to_string() };
             vec![inline_creature_result(&creature, None)]
         }
         _ => {
             let creature = { mallard.lock().await.get_creature().to_string() };
-            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, creature.";
+            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, typst, latex, math, creature.";
             vec![inline_creature_result(&creature, Some(hint))]
         }
     };
@@ -1172,6 +1181,92 @@ fn inline_pick(rest: &str) -> Vec<InlineQueryResult> {
         )
         .description(format!("из {} вариантов", options.len())),
     )]
+}
+
+async fn inline_render(
+    bot: &Bot,
+    config: &BotConfig,
+    rest: &str,
+    route: MathRoute,
+) -> Vec<InlineQueryResult> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        let body = match route {
+            MathRoute::Typst => "пример: typst x^2 + 1",
+            MathRoute::Latex => "пример: latex \\frac{1}{2}",
+            MathRoute::Auto => "пример: math \\frac{1}{2}",
+        };
+        return vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+            uuid::Uuid::new_v4().to_string(),
+            body,
+            InputMessageContent::Text(InputMessageContentText::new(body.to_string())),
+        ))];
+    }
+
+    let dialect = match route {
+        MathRoute::Typst => crate::math::Dialect::Typst,
+        MathRoute::Latex => crate::math::Dialect::Latex,
+        MathRoute::Auto => crate::math::detect(rest),
+    };
+
+    match render_to_file_ids(bot, config, rest, dialect).await {
+        Ok(ids) if !ids.is_empty() => {
+            let total = ids.len();
+            let file_id = ids.into_iter().next().unwrap();
+            let title = match dialect {
+                crate::math::Dialect::Typst => format!("typst: {}", short_preview(rest)),
+                crate::math::Dialect::Latex => format!("latex: {}", short_preview(rest)),
+            };
+            let description = if total > 1 {
+                format!("страница 1/{total} — для всех страниц используйте /typst в чате")
+            } else {
+                dialect.name().to_string()
+            };
+            vec![InlineQueryResult::CachedPhoto(
+                InlineQueryResultCachedPhoto::new(uuid::Uuid::new_v4().to_string(), file_id)
+                    .title(title)
+                    .description(description),
+            )]
+        }
+        Ok(_) => {
+            let body = "ничего не вышло — пустой результат.";
+            vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+                uuid::Uuid::new_v4().to_string(),
+                "пусто",
+                InputMessageContent::Text(InputMessageContentText::new(body.to_string())),
+            ))]
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let trimmed: String = if text.chars().count() > 200 {
+                let mut s: String = text.chars().take(200).collect();
+                s.push('…');
+                s
+            } else {
+                text
+            };
+            let title = format!("\u{26A0}\u{FE0F} ошибка ({})", dialect.name());
+            vec![InlineQueryResult::Article(
+                InlineQueryResultArticle::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    title,
+                    InputMessageContent::Text(InputMessageContentText::new(trimmed.clone())),
+                )
+                .description(trimmed),
+            )]
+        }
+    }
+}
+
+fn short_preview(s: &str) -> String {
+    let stripped: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if stripped.chars().count() > 50 {
+        let mut t: String = stripped.chars().take(50).collect();
+        t.push('…');
+        t
+    } else {
+        stripped
+    }
 }
 
 fn inline_horoscope() -> Vec<InlineQueryResult> {
@@ -2760,6 +2855,97 @@ fn typst_opts_from_env() -> crate::typst::RenderOpts {
         opts.package_cache_path = Some(std::path::PathBuf::from(path));
     }
     opts
+}
+
+/// Cache key bound to render-affecting options. Bump `SCHEMA` when the
+/// preamble, padding, font picks, or mitex version change in a way that
+/// should invalidate previously-stored file_ids.
+fn render_cache_key(
+    dialect: crate::math::Dialect,
+    doc: &str,
+    opts: &crate::typst::RenderOpts,
+) -> String {
+    use sha2::{Digest, Sha256};
+    const SCHEMA: u32 = 1;
+    let mut h = Sha256::new();
+    h.update(b"mallard-render");
+    h.update(SCHEMA.to_le_bytes());
+    h.update(b"|");
+    h.update(dialect.name().as_bytes());
+    h.update(b"|");
+    h.update(opts.ppi.to_le_bytes());
+    h.update(opts.text_size_pt.to_le_bytes());
+    h.update(opts.min_width_px.to_le_bytes());
+    h.update(opts.min_height_px.to_le_bytes());
+    h.update(b"|");
+    h.update(doc.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Upload `bytes` as a silent photo to the admin's DM (the "stash chat"),
+/// capture the photo's `file_id`, then delete the message. Telegram keeps
+/// the underlying photo file around indefinitely — the `file_id` we
+/// captured stays valid forever and can be referenced from any future
+/// answer (inline result, send_photo by id, …) without re-uploading.
+async fn stash_upload(bot: &Bot, stash_chat: ChatId, bytes: Vec<u8>) -> anyhow::Result<FileId> {
+    let m = bot
+        .send_photo(stash_chat, InputFile::memory(bytes))
+        .disable_notification(true)
+        .await?;
+    let file_id = m
+        .photo()
+        .and_then(|sizes| sizes.last())
+        .map(|s| s.file.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("stash response had no photo"))?;
+    if let Err(e) = bot.delete_message(stash_chat, m.id).await {
+        // Not fatal — the file_id is captured regardless. Log so we notice
+        // if the admin's DM accumulates renders.
+        log::warn!("stash delete_message failed: {e}");
+    }
+    Ok(file_id)
+}
+
+/// Resolve `(source, dialect)` to one Telegram `file_id` per rendered
+/// page, using `render_cache` as a memoizing store and the admin's DM as
+/// the upload stash. Errors surface compile failures, missing admin
+/// config, and upload problems separately so callers can present them
+/// usefully.
+async fn render_to_file_ids(
+    bot: &Bot,
+    config: &BotConfig,
+    source: &str,
+    dialect: crate::math::Dialect,
+) -> anyhow::Result<Vec<FileId>> {
+    let opts = typst_opts_from_env();
+    let doc = crate::math::assemble(source, dialect, &opts);
+    let key = render_cache_key(dialect, &doc, &opts);
+
+    if let Ok(Some(ids)) = config.db.render_cache_get(&key).await {
+        log::debug!("render cache hit: {key}");
+        return Ok(ids.into_iter().map(FileId).collect());
+    }
+
+    let admin = config
+        .admin_id
+        .ok_or_else(|| anyhow::anyhow!("инлайн-картинки требуют настроенного админа"))?;
+    let stash_chat = ChatId(admin.0 as i64);
+
+    let pages = crate::typst::compile_doc(&doc, &opts)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut ids = Vec::with_capacity(pages.len());
+    for bytes in pages {
+        let id = stash_upload(bot, stash_chat, bytes).await?;
+        ids.push(id);
+    }
+
+    let raw_strings: Vec<String> = ids.iter().map(|f| f.0.clone()).collect();
+    if let Err(e) = config.db.render_cache_put(&key, &raw_strings).await {
+        log::warn!("render_cache_put({key}): {e}");
+    }
+
+    Ok(ids)
 }
 
 /// Single page → `send_photo`. Two-to-ten pages → `send_media_group`

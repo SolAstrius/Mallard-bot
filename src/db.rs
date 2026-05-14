@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS nix_meta (
     value TEXT NOT NULL
 );
 
+-- Maps render-input hashes to Telegram `file_id`s so we don't re-render
+-- and re-upload the same source. Used by inline-mode photo answers, which
+-- *only* accept already-uploaded files (no public URL host on our side).
+-- `file_ids_json` is a JSON array — multi-page renders cache every page.
+CREATE TABLE IF NOT EXISTS render_cache (
+    doc_hash      TEXT PRIMARY KEY,
+    file_ids_json TEXT NOT NULL,
+    created       INTEGER NOT NULL,
+    hits          INTEGER NOT NULL DEFAULT 0
+);
+
 -- Per-user opt-in for the rich inline-query handler. Missing row → user
 -- gets the legacy creature response on inline queries; presence → query
 -- string is parsed and dispatched. Per-user (not per-chat) because inline
@@ -431,6 +442,63 @@ impl Db {
                 .query_map(rusqlite::params![b, limit], pkg_row_with_extra)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    // ---------- render cache (typst/mitex → file_id) ----------
+
+    pub async fn render_cache_get(&self, doc_hash: &str) -> rusqlite::Result<Option<Vec<String>>> {
+        let conn = self.conn.clone();
+        let doc_hash = doc_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT file_ids_json FROM render_cache WHERE doc_hash = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![doc_hash])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let json: String = row.get(0)?;
+            drop(rows);
+            drop(stmt);
+            // Best-effort hit-counter bump.
+            let _ = conn.execute(
+                "UPDATE render_cache SET hits = hits + 1 WHERE doc_hash = ?1",
+                rusqlite::params![doc_hash],
+            );
+            match serde_json::from_str::<Vec<String>>(&json) {
+                Ok(v) => Ok::<_, rusqlite::Error>(Some(v)),
+                Err(_) => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    pub async fn render_cache_put(
+        &self,
+        doc_hash: &str,
+        file_ids: &[String],
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        let doc_hash = doc_hash.to_string();
+        let json = serde_json::to_string(file_ids).unwrap_or_else(|_| "[]".to_string());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO render_cache(doc_hash, file_ids_json, created, hits) \
+                 VALUES(?1, ?2, ?3, 0) \
+                 ON CONFLICT(doc_hash) DO UPDATE SET \
+                   file_ids_json = excluded.file_ids_json, created = excluded.created",
+                rusqlite::params![doc_hash, json, now],
+            )?;
+            Ok::<_, rusqlite::Error>(())
         })
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
