@@ -806,7 +806,6 @@ async fn cmd_soa(tokens: &[&str], rules: &[(String, String)]) -> String {
     let results = futures::future::join_all(futs).await;
 
     // SOA rdata format: "mname rname serial refresh retry expire minimum".
-    // Serial is the 3rd whitespace-separated token.
     let serials: Vec<Option<u32>> = results
         .iter()
         .map(|(_, _, q)| {
@@ -817,47 +816,86 @@ async fn cmd_soa(tokens: &[&str], rules: &[(String, String)]) -> String {
         })
         .collect();
 
-    // Majority serial = the most-frequent one.
-    let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    for s in serials.iter().flatten() {
-        *counts.entry(*s).or_default() += 1;
+    // Cohort by serial value (same pattern as /dns prop). Largest cohort
+    // becomes [A]; in a tie, first-seen wins. Avoids the "majority picked
+    // by HashMap iteration order" bug — Route 53 returns serial=1 by
+    // design, NS1 returns the real serial, and a 4-4 tie shouldn't crown
+    // one as ✅ and the other as ⚠️.
+    let mut cohort_keys: Vec<String> = Vec::new();
+    let mut cohort_members: Vec<Vec<usize>> = Vec::new();
+    for (i, s) in serials.iter().enumerate() {
+        let key = s.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+        match cohort_keys.iter().position(|k| k == &key) {
+            Some(idx) => cohort_members[idx].push(i),
+            None => {
+                cohort_keys.push(key);
+                cohort_members.push(vec![i]);
+            }
+        }
     }
-    let majority: Option<u32> = counts
-        .iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(s, _)| *s);
+    let mut order: Vec<usize> = (0..cohort_keys.len()).collect();
+    order.sort_by(|a, b| cohort_members[*b].len().cmp(&cohort_members[*a].len()));
+    let mut letter: Vec<char> = vec![' '; results.len()];
+    for (rank, idx) in order.iter().enumerate() {
+        let l = char::from(b'A' + rank as u8);
+        for &i in &cohort_members[*idx] {
+            letter[i] = l;
+        }
+    }
 
-    let unanimous = counts.len() <= 1
-        && serials.iter().all(|s| s.is_some());
+    let unanimous = cohort_keys.len() == 1;
     let mut out = format!(
         "; SOA-сверка для {} ({} авторитетных NS)\n",
         domain,
         auths.len()
     );
     if unanimous {
-        let m = majority.map(|s| s.to_string()).unwrap_or_default();
-        out.push_str(&format!("; все NS на одном serial: {m} ✅\n"));
-    } else {
         out.push_str(&format!(
-            "; ⚠️ расхождение serial — {} разных значений\n",
-            counts.len()
+            "; все NS на одном serial: {} ✅\n",
+            cohort_keys[0]
         ));
+    } else {
+        let summary: Vec<String> = order
+            .iter()
+            .enumerate()
+            .map(|(rank, idx)| {
+                let l = char::from(b'A' + rank as u8);
+                format!(
+                    "{}={} (serial {})",
+                    l,
+                    cohort_members[*idx].len(),
+                    cohort_keys[*idx]
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "; ⚠️ {} разных serial: {}\n",
+            cohort_keys.len(),
+            summary.join(" ")
+        ));
+        // AWS Route 53 famously returns serial=1 for every zone. Note it
+        // explicitly so the user doesn't think their zone is broken.
+        if cohort_keys.iter().any(|k| k == "1") {
+            out.push_str(
+                "; примечание: serial=1 — известная особенность AWS Route 53; реальное состояние зоны скрыто\n",
+            );
+        }
     }
-    for ((ns, ip, q), serial) in results.iter().zip(serials.iter()) {
+
+    for (i, ((ns, ip, q), serial)) in results.iter().zip(serials.iter()).enumerate() {
+        let l = letter[i];
         let badge = if q.is_hard_error() {
             "❌".to_string()
-        } else if *serial == majority {
+        } else if unanimous {
             "✅".to_string()
+        } else if l == 'A' {
+            format!("[{l}] ✅")
         } else {
-            "⚠️".to_string()
+            format!("[{l}] ⚠️")
         };
         let serial_str = serial
             .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                q.error
-                    .clone()
-                    .unwrap_or_else(|| "?".to_string())
-            });
+            .unwrap_or_else(|| q.error.clone().unwrap_or_else(|| "?".to_string()));
         let rtt_str = format!("{:>4}ms", q.rtt.as_millis());
         out.push_str(&format!(
             "{badge} {:<32} {:<15} {} — serial {}\n",
