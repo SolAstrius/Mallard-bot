@@ -41,6 +41,7 @@ brotli = { version = "8.0.2", default-features = false, features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
 fend-core = "1.5"
+symbolica = { version = "1.5", default-features = false, features = ["faster_alloc"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

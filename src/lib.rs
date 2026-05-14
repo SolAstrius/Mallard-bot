@@ -15,6 +15,7 @@ pub mod quote;
 pub mod responses;
 pub mod sessions;
 pub mod stickerpack;
+pub mod sym;
 pub mod typst;
 pub mod video;
 

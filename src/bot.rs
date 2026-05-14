@@ -88,6 +88,8 @@ pub enum Command {
     Inline,
     #[command(description = "посчитать: /calc 1/3 + 1/3 + 1/3, /calc 60 mph in m/s, /calc 2^256")]
     Calc(String),
+    #[command(description = "символьные штуки: /sym diff(sin(x), x), /sym factor(x^2-1), /sym expand((x+1)^3)")]
+    Sym(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -223,6 +225,17 @@ const HELP_CALC: &str = "/calc <выражение> — посчитать. По
 Для символьных штук (производные, упрощение) будет отдельный /sym.\n\
 кря-кря.";
 
+const HELP_SYM: &str = "/sym <выражение> — символьные операции через symbolica. Кряква пришлёт ответ текстом и красиво отрисованной картинкой.\n\
+Что умеет:\n\
+* expand(<выр>) — раскрыть скобки: /sym expand((x+1)^3)\n\
+* factor(<выр>) — разложить на множители: /sym factor(x^2 - 1)\n\
+* together(<выр>) — привести к общему знаменателю: /sym together(1/x + 1/y)\n\
+* diff(<выр>, <переменная>) — производная: /sym diff(sin(x)*x^2, x)\n\
+  (синоним: derivative)\n\
+* <выр> — просто разобрать и привести к канонической форме\n\
+Для численных вычислений см. /calc — там точная арифметика, единицы измерения и даты.\n\
+кря-кря.";
+
 const HELP_INLINE: &str = "/inline — переключить расширенный inline-режим (только в личке у кряквы).\n\
 По умолчанию инлайн (@<бот> ...) возвращает только зверушку дня — это легаси и оно не меняется.\n\
 После включения в инлайне доступны:\n\
@@ -291,6 +304,7 @@ fn help_for(query: &str) -> String {
         "math" => HELP_MATH.to_string(),
         "inline" => HELP_INLINE.to_string(),
         "calc" => HELP_CALC.to_string(),
+        "sym" => HELP_SYM.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -475,6 +489,7 @@ async fn handle_command(
         Command::Math(r) => format!("math {r}").trim().to_string(),
         Command::Inline => "inline".to_string(),
         Command::Calc(r) => format!("calc {r}").trim().to_string(),
+        Command::Sym(r) => format!("sym {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -514,6 +529,7 @@ async fn handle_command(
         Command::Math(rest) => handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Auto).await,
         Command::Inline => handle_inline_toggle(&bot, &msg, &config).await,
         Command::Calc(rest) => handle_calc(&bot, &msg, &rest, &config).await,
+        Command::Sym(rest) => handle_sym(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -3134,4 +3150,64 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+// ---------- /sym — symbolica CAS ----------
+
+async fn handle_sym(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "util.sym").await {
+        return Ok(());
+    }
+    let expr = rest.trim();
+    if expr.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "примеры: /sym diff(sin(x), x), /sym factor(x^2-1), /sym expand((x+1)^3), /sym together(1/x + 1/y)",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let opts = crate::sym::SymOpts::default();
+    let result = match crate::sym::evaluate(expr, &opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            let text = e.to_string();
+            bot.send_message(
+                msg.chat.id,
+                format!("\u{26A0}\u{FE0F} {}", truncate_chars(&text, 600)),
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Always send the text answer. Then attempt a pretty rendered image
+    // via mitex (Symbolica's LaTeX output is mitex-compatible). Render
+    // failures are silent — text already conveyed the result.
+    let text_body = format!("= {}", truncate_chars(&result.text, 3500));
+    bot.send_message(msg.chat.id, text_body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+
+    let render_opts = typst_opts_from_env();
+    if let Ok(pages) = crate::math::render(
+        &result.latex,
+        crate::math::Dialect::Latex,
+        &render_opts,
+    )
+    .await
+    {
+        if let Err(e) = send_typst_pages(bot, msg, pages).await {
+            log::warn!("sym render send: {e}");
+        }
+    }
+    Ok(())
 }
