@@ -2286,6 +2286,42 @@ async fn cha_gossip(
 
 // ---------- /typst — render typst snippets to PNG ----------
 
+/// Pull source out of a replied message, preferring fenced code blocks
+/// (Telegram delivers them with the fences already stripped) over plain
+/// text. Order: ```typst → any ``` → inline ` ` → whole text.
+fn extract_typst_source(msg: &Message) -> Option<String> {
+    use teloxide::types::MessageEntityKind;
+
+    let entities = msg
+        .parse_entities()
+        .or_else(|| msg.parse_caption_entities());
+
+    if let Some(refs) = entities {
+        for e in &refs {
+            if let MessageEntityKind::Pre {
+                language: Some(lang),
+            } = e.kind()
+            {
+                if lang.eq_ignore_ascii_case("typst") {
+                    return Some(e.text().to_string());
+                }
+            }
+        }
+        for e in &refs {
+            if matches!(e.kind(), MessageEntityKind::Pre { .. }) {
+                return Some(e.text().to_string());
+            }
+        }
+        for e in &refs {
+            if matches!(e.kind(), MessageEntityKind::Code) {
+                return Some(e.text().to_string());
+            }
+        }
+    }
+
+    msg.text().or_else(|| msg.caption()).map(|s| s.to_string())
+}
+
 async fn handle_typst(
     bot: &Bot,
     msg: &Message,
@@ -2300,8 +2336,8 @@ async fn handle_typst(
     let source: String = if !inline.is_empty() {
         inline.to_string()
     } else if let Some(reply) = msg.reply_to_message() {
-        match reply.text().or_else(|| reply.caption()) {
-            Some(t) => t.to_string(),
+        match extract_typst_source(reply) {
+            Some(t) => t,
             None => {
                 bot.send_message(
                     msg.chat.id,
