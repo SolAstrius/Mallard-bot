@@ -1448,17 +1448,53 @@ async fn handle_npkg(
             top.description.as_str()
         };
         let mut lines = vec![format!(
-            "\u{1F4E6} <b>{}</b> · {}",
+            "\u{1F4E6} <b>{}</b>, {}",
             html_escape(&top.attr_name),
             html_escape(&top.version)
         )];
+        // Health flags first, prominently.
+        let mut flags = Vec::new();
+        if top.broken {
+            flags.push("сломан");
+        }
+        if top.insecure {
+            flags.push("небезопасен");
+        }
+        if top.unfree {
+            flags.push("несвободная лицензия");
+        }
+        if !flags.is_empty() {
+            lines.push(format!("\u{26A0}\u{FE0F} {}", flags.join(", ")));
+        }
         lines.push(html_escape(descr));
+        if !top.homepage.is_empty() {
+            lines.push(format!(
+                "🏠 <a href=\"{0}\">{0}</a>",
+                html_escape(&top.homepage)
+            ));
+        }
+        if !top.license.is_empty() {
+            lines.push(format!("📜 {}", html_escape(&top.license)));
+        }
+        if !top.platforms.is_empty() {
+            lines.push(format!("🖥 {}", format_platforms(&top.platforms)));
+        }
+        if !top.maintainers.is_empty() {
+            lines.push(format!(
+                "👥 {}",
+                html_escape(&format_maintainers(&top.maintainers))
+            ));
+        }
+        if let Some(link) = position_to_url(&top.position) {
+            let display = top.position.split('/').next_back().unwrap_or(&top.position);
+            lines.push(format!(
+                "↳ <a href=\"{}\">{}</a>",
+                html_escape(&link),
+                html_escape(display)
+            ));
+        }
         lines.push(format!(
             "• <code>nix run nixpkgs#{}</code>",
-            html_escape(&top.attr_name)
-        ));
-        lines.push(format!(
-            "• <code>environment.systemPackages = [ pkgs.{} ];</code>",
             html_escape(&top.attr_name)
         ));
         if !top.main_program.is_empty() && top.main_program != top.attr_name {
@@ -1594,17 +1630,23 @@ async fn handle_nixwhere(
             html_escape(q)
         )
     } else {
-        let mut lines = vec![format!("\u{1F50E} <code>{}</code> → ", html_escape(q))];
+        let mut lines = vec![format!("\u{1F50E} <code>{}</code> →", html_escape(q))];
         for h in &hits {
-            let suffix = if !h.main_program.is_empty() && h.main_program != q {
+            let main_suffix = if !h.main_program.is_empty() && h.main_program != q {
                 format!(" (main: <code>{}</code>)", html_escape(&h.main_program))
             } else {
                 String::new()
             };
+            let descr = if h.description.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", html_escape(&h.description))
+            };
             lines.push(format!(
-                "• <code>{}</code>{}",
+                "• <code>{}</code>{}{}",
                 html_escape(&h.attr_name),
-                suffix
+                main_suffix,
+                descr
             ));
         }
         lines.join("\n")
@@ -1620,6 +1662,79 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Compact platform-list summary: group by OS, list architectures per OS,
+/// elide when the list is suspiciously "all platforms".
+fn format_platforms(csv: &str) -> String {
+    use std::collections::BTreeMap;
+    let entries: Vec<&str> = csv.split(',').filter(|s| !s.is_empty()).collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    if entries.len() > 40 {
+        // Almost certainly `lib.platforms.all` — not useful to enumerate.
+        return "почти любая платформа".to_string();
+    }
+    // Parse `<arch>-<os>` (split on the LAST hyphen since arches contain hyphens too).
+    let mut by_os: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in &entries {
+        if let Some(idx) = e.rfind('-') {
+            let arch = &e[..idx];
+            let os = &e[idx + 1..];
+            by_os.entry(os).or_default().push(arch);
+        }
+    }
+    // Prioritise linux + darwin first; others alphabetical.
+    let mut parts = Vec::new();
+    let preferred = ["linux", "darwin"];
+    for &os in &preferred {
+        if let Some(arches) = by_os.remove(os) {
+            parts.push(format!("{} ({})", os, arches.join(", ")));
+        }
+    }
+    for (os, arches) in by_os {
+        parts.push(format!("{} ({})", os, arches.join(", ")));
+    }
+    parts.join(", ")
+}
+
+/// Format the maintainer CSV — keep github handles with `@`, raw names as-is.
+fn format_maintainers(csv: &str) -> String {
+    csv.split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else if s.contains(' ') {
+                // Names with spaces: probably a real name (no github handle).
+                Some(s.to_string())
+            } else {
+                Some(format!("@{s}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Render a nixpkgs source position (`path/to/file.nix:62`) as a GitHub
+/// permalink on the `nixos-unstable` branch.
+fn position_to_url(position: &str) -> Option<String> {
+    if position.is_empty() {
+        return None;
+    }
+    let (path, line) = match position.rsplit_once(':') {
+        Some((p, n)) => (p, n.parse::<u32>().ok()),
+        None => (position, None),
+    };
+    let mut url = format!(
+        "https://github.com/NixOS/nixpkgs/blob/nixos-unstable/{}",
+        path
+    );
+    if let Some(l) = line {
+        url.push_str(&format!("#L{l}"));
+    }
+    Some(url)
 }
 
 // ---------- per-chat feature toggles ----------

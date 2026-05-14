@@ -115,6 +115,44 @@ async fn npkg(db: &Db, q: &str) -> anyhow::Result<()> {
             h.version,
             h.description
         );
+        let mut flags = Vec::new();
+        if h.broken {
+            flags.push("broken");
+        }
+        if h.insecure {
+            flags.push("insecure");
+        }
+        if h.unfree {
+            flags.push("unfree");
+        }
+        if !flags.is_empty() {
+            println!("    flags: {}", flags.join(", "));
+        }
+        if !h.homepage.is_empty() {
+            println!("    homepage: {}", h.homepage);
+        }
+        if !h.license.is_empty() {
+            println!("    license: {}", h.license);
+        }
+        if !h.platforms.is_empty() {
+            let count = h.platforms.split(',').count();
+            let preview = h
+                .platforms
+                .split(',')
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "    platforms ({count}): {preview}{}",
+                if count > 6 { " ..." } else { "" }
+            );
+        }
+        if !h.maintainers.is_empty() {
+            println!("    maintainers: {}", h.maintainers);
+        }
+        if !h.position.is_empty() {
+            println!("    position: {}", h.position);
+        }
         if !h.main_program.is_empty() && h.main_program != h.attr_name {
             println!("    main: {}", h.main_program);
         }

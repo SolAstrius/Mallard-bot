@@ -42,14 +42,41 @@ struct PackageRecord {
     meta: Option<PackageMeta>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct PackageMeta {
+    // All "stringy" fields are Value because nixpkgs occasionally emits a
+    // `{_type: "mdDoc", text: "..."}` envelope or other structured form.
+    // Unwrapped via `value_to_string` below.
     #[serde(default)]
-    description: Option<String>,
+    description: Option<serde_json::Value>,
     #[serde(rename = "longDescription", default)]
-    long_description: Option<String>,
+    long_description: Option<serde_json::Value>,
     #[serde(rename = "mainProgram", default)]
-    main_program: Option<String>,
+    main_program: Option<serde_json::Value>,
+    #[serde(default)]
+    homepage: Option<serde_json::Value>,
+    #[serde(default)]
+    license: Option<serde_json::Value>,
+    #[serde(default)]
+    position: Option<serde_json::Value>,
+    #[serde(default)]
+    platforms: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    maintainers: Option<Vec<MaintainerEntry>>,
+    #[serde(default)]
+    broken: Option<bool>,
+    #[serde(default)]
+    insecure: Option<bool>,
+    #[serde(default)]
+    unfree: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct MaintainerEntry {
+    #[serde(default)]
+    github: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -149,21 +176,147 @@ fn parse_packages(compressed: &[u8]) -> anyhow::Result<Vec<NixPkgRow>> {
     let file: PackagesFile = serde_json::from_slice(&buf)?;
     let mut rows = Vec::with_capacity(file.packages.len());
     for (attr_name, rec) in file.packages {
-        let meta = rec.meta.unwrap_or(PackageMeta {
-            description: None,
-            long_description: None,
-            main_program: None,
-        });
+        let meta = rec.meta.unwrap_or_default();
+        let homepage = meta
+            .homepage
+            .as_ref()
+            .map(homepage_to_string)
+            .unwrap_or_default();
+        let license = meta
+            .license
+            .as_ref()
+            .map(license_to_string)
+            .unwrap_or_default();
+        let platforms = meta
+            .platforms
+            .unwrap_or_default()
+            .iter()
+            .filter_map(platform_to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let maintainers = meta
+            .maintainers
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| m.github.or(m.name))
+            .collect::<Vec<_>>()
+            .join(",");
         rows.push(NixPkgRow {
             attr_name,
             pname: rec.pname.unwrap_or_default(),
             version: rec.version.unwrap_or_default(),
-            description: meta.description.unwrap_or_default(),
-            long_description: meta.long_description.unwrap_or_default(),
-            main_program: meta.main_program.unwrap_or_default(),
+            description: meta
+                .description
+                .as_ref()
+                .map(value_to_string)
+                .unwrap_or_default(),
+            long_description: meta
+                .long_description
+                .as_ref()
+                .map(value_to_string)
+                .unwrap_or_default(),
+            main_program: meta
+                .main_program
+                .as_ref()
+                .map(value_to_string)
+                .unwrap_or_default(),
+            homepage,
+            license,
+            position: meta
+                .position
+                .as_ref()
+                .map(position_to_string)
+                .unwrap_or_default(),
+            platforms,
+            maintainers,
+            broken: meta.broken.unwrap_or(false),
+            insecure: meta.insecure.unwrap_or(false),
+            unfree: meta.unfree.unwrap_or(false),
         });
     }
     Ok(rows)
+}
+
+/// `platforms` entries are either plain strings (`"x86_64-linux"`) or the
+/// new structured form (`{format, families, name: "x86_64-linux"}`). Returns
+/// the canonical `<arch>-<os>` string, or `None` for unrecognised shapes.
+fn platform_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o.get("name").and_then(|x| x.as_str()).map(String::from),
+        _ => None,
+    }
+}
+
+/// Unwrap an mdDoc-style envelope (`{_type, text}`) or other structured
+/// "stringy" Value to its raw string. Returns empty for unsupported shapes.
+fn value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(o) => o
+            .get("text")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .unwrap_or_default(),
+        serde_json::Value::Array(arr) => arr
+            .first()
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `position` is normally `"path/to/file.nix:62"` but a small number of
+/// packages emit a structured `{file, line, column}` instead. Normalise to
+/// the colon-suffixed string form.
+fn position_to_string(v: &serde_json::Value) -> String {
+    if let serde_json::Value::String(s) = v {
+        return s.clone();
+    }
+    if let serde_json::Value::Object(o) = v {
+        let file = o.get("file").and_then(|x| x.as_str()).unwrap_or_default();
+        let line = o.get("line").and_then(|x| x.as_i64());
+        return match line {
+            Some(l) => format!("{file}:{l}"),
+            None => file.to_string(),
+        };
+    }
+    String::new()
+}
+
+/// `homepage` can be a string, or an array of strings, or missing.
+fn homepage_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .first()
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `license` is either a string, an object `{spdxId, fullName, ...}`, or an
+/// array of either. Reduce to SPDX (or fullName / shortName) where possible.
+fn license_to_string(v: &serde_json::Value) -> String {
+    fn one(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => o
+                .get("spdxId")
+                .and_then(|x| x.as_str())
+                .or_else(|| o.get("shortName").and_then(|x| x.as_str()))
+                .or_else(|| o.get("fullName").and_then(|x| x.as_str()))
+                .map(String::from),
+            _ => None,
+        }
+    }
+    match v {
+        serde_json::Value::Array(arr) => arr.iter().filter_map(one).collect::<Vec<_>>().join(", "),
+        other => one(other).unwrap_or_default(),
+    }
 }
 
 fn parse_options(compressed: &[u8]) -> anyhow::Result<Vec<NixOptRow>> {

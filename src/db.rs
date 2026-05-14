@@ -41,6 +41,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nix_pkg USING fts5(
     tokenize = 'unicode61 remove_diacritics 2'
 );
 
+-- Sibling table for metadata we don't search on: homepage, license, source
+-- position, platforms, maintainers, health flags. Joined to nix_pkg by
+-- attr_name. Refilled in the same transaction as nix_pkg.
+CREATE TABLE IF NOT EXISTS nix_pkg_extra (
+    attr_name   TEXT PRIMARY KEY,
+    homepage    TEXT NOT NULL,
+    license     TEXT NOT NULL,
+    position    TEXT NOT NULL,
+    platforms   TEXT NOT NULL,
+    maintainers TEXT NOT NULL,
+    broken      INTEGER NOT NULL,
+    insecure    INTEGER NOT NULL,
+    unfree      INTEGER NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS nix_opt USING fts5(
     name, type_, default_, description,
     tokenize = 'unicode61 remove_diacritics 2'
@@ -221,20 +236,38 @@ impl Db {
             let mut conn = conn.blocking_lock();
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM nix_pkg", [])?;
+            tx.execute("DELETE FROM nix_pkg_extra", [])?;
             {
-                let mut stmt = tx.prepare(
+                let mut fts = tx.prepare(
                     "INSERT INTO nix_pkg
                      (attr_name, pname, version, description, long_description, main_program)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
+                let mut extra = tx.prepare(
+                    "INSERT INTO nix_pkg_extra
+                     (attr_name, homepage, license, position, platforms, maintainers,
+                      broken, insecure, unfree)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )?;
                 for r in &rows {
-                    stmt.execute(rusqlite::params![
+                    fts.execute(rusqlite::params![
                         r.attr_name,
                         r.pname,
                         r.version,
                         r.description,
                         r.long_description,
                         r.main_program,
+                    ])?;
+                    extra.execute(rusqlite::params![
+                        r.attr_name,
+                        r.homepage,
+                        r.license,
+                        r.position,
+                        r.platforms,
+                        r.maintainers,
+                        if r.broken { 1 } else { 0 },
+                        if r.insecure { 1 } else { 0 },
+                        if r.unfree { 1 } else { 0 },
                     ])?;
                 }
             }
@@ -286,27 +319,22 @@ impl Db {
             // Rank: exact attr_name / pname / main_program matches always win,
             // then BM25 with strong attr_name weight. lower BM25 = better.
             let mut stmt = conn.prepare(
-                "SELECT attr_name, pname, version, description, long_description, main_program
-                 FROM nix_pkg
+                "SELECT p.attr_name, p.pname, p.version, p.description,
+                        p.long_description, p.main_program,
+                        e.homepage, e.license, e.position, e.platforms,
+                        e.maintainers, e.broken, e.insecure, e.unfree
+                 FROM nix_pkg p
+                 LEFT JOIN nix_pkg_extra e ON e.attr_name = p.attr_name
                  WHERE nix_pkg MATCH ?1
                  ORDER BY
-                   (attr_name = ?2) DESC,
-                   (pname = ?2) DESC,
-                   (main_program = ?2) DESC,
+                   (p.attr_name = ?2) DESC,
+                   (p.pname = ?2) DESC,
+                   (p.main_program = ?2) DESC,
                    bm25(nix_pkg, 12.0, 8.0, 1.0, 1.5, 0.5, 4.0)
                  LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![q, raw, limit], |row| {
-                    Ok(NixPkgRow {
-                        attr_name: row.get(0)?,
-                        pname: row.get(1)?,
-                        version: row.get(2)?,
-                        description: row.get(3)?,
-                        long_description: row.get(4)?,
-                        main_program: row.get(5)?,
-                    })
-                })?
+                .query_map(rusqlite::params![q, raw, limit], pkg_row_with_extra)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, rusqlite::Error>(rows)
         })
@@ -361,25 +389,18 @@ impl Db {
             // First exact mainProgram, then attr_name, then pname. Union via
             // a temporary CTE so we keep the order.
             let mut stmt = conn.prepare(
-                "SELECT attr_name, pname, version, description, long_description, main_program
-                 FROM nix_pkg
-                 WHERE main_program = ?1
-                    OR attr_name = ?1
-                    OR pname = ?1
-                 ORDER BY (main_program = ?1) DESC, (attr_name = ?1) DESC
+                "SELECT p.attr_name, p.pname, p.version, p.description,
+                        p.long_description, p.main_program,
+                        e.homepage, e.license, e.position, e.platforms,
+                        e.maintainers, e.broken, e.insecure, e.unfree
+                 FROM nix_pkg p
+                 LEFT JOIN nix_pkg_extra e ON e.attr_name = p.attr_name
+                 WHERE p.main_program = ?1 OR p.attr_name = ?1 OR p.pname = ?1
+                 ORDER BY (p.main_program = ?1) DESC, (p.attr_name = ?1) DESC
                  LIMIT ?2",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![b, limit], |row| {
-                    Ok(NixPkgRow {
-                        attr_name: row.get(0)?,
-                        pname: row.get(1)?,
-                        version: row.get(2)?,
-                        description: row.get(3)?,
-                        long_description: row.get(4)?,
-                        main_program: row.get(5)?,
-                    })
-                })?
+                .query_map(rusqlite::params![b, limit], pkg_row_with_extra)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, rusqlite::Error>(rows)
         })
@@ -535,7 +556,7 @@ impl Db {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NixPkgRow {
     pub attr_name: String,
     pub pname: String,
@@ -543,6 +564,19 @@ pub struct NixPkgRow {
     pub description: String,
     pub long_description: String,
     pub main_program: String,
+    // From nix_pkg_extra. Empty strings when absent.
+    pub homepage: String,
+    pub license: String,
+    /// `pkgs/by-name/.../foo.nix:62` — relative path inside nixpkgs, with
+    /// trailing `:line`. Empty when absent.
+    pub position: String,
+    /// CSV of `<arch>-<os>` triples. Empty when absent.
+    pub platforms: String,
+    /// CSV of github handles. Empty when absent.
+    pub maintainers: String,
+    pub broken: bool,
+    pub insecure: bool,
+    pub unfree: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -551,6 +585,28 @@ pub struct NixOptRow {
     pub type_: String,
     pub default_: String,
     pub description: String,
+}
+
+/// Row mapper for `nix_pkg LEFT JOIN nix_pkg_extra` — columns 0..=5 come from
+/// the FTS table, 6..=13 from the extras table (NULLs become empty strings /
+/// false booleans).
+fn pkg_row_with_extra(row: &rusqlite::Row<'_>) -> rusqlite::Result<NixPkgRow> {
+    Ok(NixPkgRow {
+        attr_name: row.get(0)?,
+        pname: row.get(1)?,
+        version: row.get(2)?,
+        description: row.get(3)?,
+        long_description: row.get(4)?,
+        main_program: row.get(5)?,
+        homepage: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        license: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        position: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+        platforms: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        maintainers: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+        broken: row.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
+        insecure: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+        unfree: row.get::<_, Option<i64>>(13)?.unwrap_or(0) != 0,
+    })
 }
 
 /// Escape a user query for FTS5 by wrapping each whitespace-split token in
