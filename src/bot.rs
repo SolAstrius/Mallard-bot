@@ -2010,7 +2010,7 @@ fn render_feature_overview(chat_id: i64, rules: &[(String, bool)]) -> String {
     }
 
     lines.push(String::new());
-    lines.push("эффективно:".to_string());
+    lines.push("состояние:".to_string());
     for cat in features::categories() {
         let cat_prefix = format!("{cat}.");
         let mut header_pushed = false;
@@ -2026,7 +2026,7 @@ fn render_feature_overview(chat_id: i64, rules: &[(String, bool)]) -> String {
             let mark = if on { "\u{2705}" } else { "\u{274C}" };
             let src = by
                 .map(|r| format!("← {r}"))
-                .unwrap_or_else(|| "← default".to_string());
+                .unwrap_or_else(|| "← по умолчанию".to_string());
             lines.push(format!("    {mark} {} {src}", f.path));
         }
     }
@@ -2055,7 +2055,7 @@ fn render_feature_subtree(rules: &[(String, bool)], pat: &FeaturePattern) -> Str
         let mark = if on { "\u{2705}" } else { "\u{274C}" };
         let src = by
             .map(|r| format!("← {r}"))
-            .unwrap_or_else(|| "← default".to_string());
+            .unwrap_or_else(|| "← по умолчанию".to_string());
         lines.push(format!("  {mark} {} {src}", leaf.path));
     }
     lines.join("\n")
