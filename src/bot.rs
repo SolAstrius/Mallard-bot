@@ -88,7 +88,7 @@ pub enum Command {
     Inline,
     #[command(description = "посчитать: /calc 1/3 + 1/3 + 1/3, /calc 60 mph in m/s, /calc 2^256")]
     Calc(String),
-    #[command(description = "символьные штуки: /sym diff(sin(x), x), /sym factor(x^2-1), /sym expand((x+1)^3)")]
+    #[command(description = "символьные штуки: /sym diff(sin(x), x), /sym solve(x^2-4, x), /sym series(sin(x), x, 0, 7)")]
     Sym(String),
     #[command(description = "нарисовать график: /plot sin(x), 0, 2*pi")]
     Plot(String),
@@ -227,6 +227,14 @@ const HELP_CALC: &str = "/calc <выражение> — посчитать. По
 Для символьных штук (производные, упрощение) будет отдельный /sym.\n\
 кря-кря.";
 
+const HELP_THEME: &str = "Тёмная тема для всех картинок (typst, latex, /sym, /plot).\n\
+По умолчанию белый фон, чёрный текст. Включить тёмную:\n\
+/feature util.theme.dark on\n\
+Выключить обратно:\n\
+/feature util.theme.dark off\n\
+Кэш картинок отдельный для каждой темы, так что переключение не путает закэшированные старые рендеры.\n\
+кря-кря.";
+
 const HELP_PLOT: &str = "/plot <выражение>, <от>, <до> — нарисовать график. Через typst + cetz-plot.\n\
 Примеры:\n\
 * /plot sin(x), 0, 2*pi — одна функция\n\
@@ -239,11 +247,14 @@ const HELP_PLOT: &str = "/plot <выражение>, <от>, <до> — нари
 
 const HELP_SYM: &str = "/sym <выражение> — символьные операции через symbolica. Кряква пришлёт ответ текстом и красиво отрисованной картинкой.\n\
 Что умеет:\n\
-* expand(<выр>) — раскрыть скобки: /sym expand((x+1)^3)\n\
+* expand(<выр>) — раскрыть скобки: /sym expand((x+1)^5)\n\
 * factor(<выр>) — разложить на множители: /sym factor(x^2 - 1)\n\
 * together(<выр>) — привести к общему знаменателю: /sym together(1/x + 1/y)\n\
-* diff(<выр>, <переменная>) — производная: /sym diff(sin(x)*x^2, x)\n\
-  (синоним: derivative)\n\
+* simplify(<выр>) — together + expand за один проход\n\
+* diff(<выр>, <переменная>) — производная: /sym diff(sin(x)*x^2, x) (синоним: derivative)\n\
+* series(<выр> [, <var> [, <point> [, <depth>]]]) — ряд Тейлора: /sym series(sin(x), x, 0, 7). Значения по умолчанию: var=x, point=0, depth=5.\n\
+* solve(<уравнение>, <переменная>) — линейное уравнение: /sym solve(2*x - 4, x). Для системы: /sym solve(2*x + y - 1, x + y + 1, x, y) (сначала все уравнения, потом все переменные).\n\
+* replace(<выр>, <шаблон>, <замена>) — переписывание по шаблону. Идентификаторы с подчёркиванием в конце — wildcard: /sym replace(f(1,2,x) + f(1,2,3), f(1,2,y_), f(1,2,y_+1)).\n\
 * <выр> — просто разобрать и привести к канонической форме\n\
 Для численных вычислений см. /calc — там точная арифметика, единицы измерения и даты.\n\
 кря-кря.";
@@ -319,6 +330,7 @@ fn help_for(query: &str) -> String {
         "calc" => HELP_CALC.to_string(),
         "sym" => HELP_SYM.to_string(),
         "plot" => HELP_PLOT.to_string(),
+        "theme" | "dark" => HELP_THEME.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -2937,7 +2949,7 @@ async fn handle_math_cmd(
         MathRoute::Auto => crate::math::detect(&source),
     };
 
-    let opts = typst_opts_from_env();
+    let opts = typst_opts_for(config, msg.chat.id).await;
     match crate::math::render(&source, dialect, &opts).await {
         Ok(pages) => {
             send_typst_pages(bot, msg, pages).await?;
@@ -2990,7 +3002,7 @@ async fn ambient_fenced(
     });
     let Some(source) = source else { return };
 
-    let opts = typst_opts_from_env();
+    let opts = typst_opts_for(config, msg.chat.id).await;
     match crate::math::render(&source, dialect, &opts).await {
         Ok(pages) => {
             if let Err(e) = send_typst_pages(bot, msg, pages).await {
@@ -3022,7 +3034,7 @@ async fn ambient_math_dollar(bot: &Bot, msg: &Message, config: &BotConfig) {
     }
 
     let dialect = crate::math::detect(source);
-    let opts = typst_opts_from_env();
+    let opts = typst_opts_for(config, msg.chat.id).await;
     match crate::math::render(source, dialect, &opts).await {
         Ok(pages) => {
             if let Err(e) = send_typst_pages(bot, msg, pages).await {
@@ -3033,12 +3045,22 @@ async fn ambient_math_dollar(bot: &Bot, msg: &Message, config: &BotConfig) {
     }
 }
 
-/// Build `RenderOpts` with the package cache path pulled from env, falling
-/// back to typst's own default when the variable isn't set (local dev).
+/// Build `RenderOpts` with env-driven defaults (package cache path from
+/// env). Theme stays at the type default (Light); call sites that have
+/// access to a chat layer use [`typst_opts_for`] to override per-chat.
 fn typst_opts_from_env() -> crate::typst::RenderOpts {
     let mut opts = crate::typst::RenderOpts::default();
     if let Ok(path) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
         opts.package_cache_path = Some(std::path::PathBuf::from(path));
+    }
+    opts
+}
+
+/// Build `RenderOpts` with the chat's theme preference applied.
+async fn typst_opts_for(config: &BotConfig, chat: ChatId) -> crate::typst::RenderOpts {
+    let mut opts = typst_opts_from_env();
+    if is_feature_enabled(config, chat, "util.theme.dark").await {
+        opts.theme = crate::typst::Theme::Dark;
     }
     opts
 }
@@ -3063,6 +3085,8 @@ fn render_cache_key(
     h.update(opts.text_size_pt.to_le_bytes());
     h.update(opts.min_width_px.to_le_bytes());
     h.update(opts.min_height_px.to_le_bytes());
+    h.update(b"|");
+    h.update(opts.theme.name().as_bytes());
     h.update(b"|");
     h.update(doc.as_bytes());
     hex::encode(h.finalize())
@@ -3150,8 +3174,8 @@ async fn plot_to_file_ids(
     args: &str,
 ) -> anyhow::Result<Vec<FileId>> {
     let req = crate::plot::parse_args(args).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let doc = crate::plot::assemble(&req);
     let opts = typst_opts_from_env();
+    let doc = crate::plot::assemble(&req, &opts);
     let key = plot_cache_key(&doc, &opts);
     doc_to_file_ids(bot, config, &key, &doc).await
 }
@@ -3165,6 +3189,8 @@ fn plot_cache_key(doc: &str, opts: &crate::typst::RenderOpts) -> String {
     h.update(b"|");
     h.update(opts.ppi.to_le_bytes());
     h.update(opts.text_size_pt.to_le_bytes());
+    h.update(b"|");
+    h.update(opts.theme.name().as_bytes());
     h.update(b"|");
     h.update(doc.as_bytes());
     hex::encode(h.finalize())
@@ -3276,7 +3302,7 @@ async fn handle_plot(
         return Ok(());
     }
 
-    let render_opts = typst_opts_from_env();
+    let render_opts = typst_opts_for(config, msg.chat.id).await;
     match crate::plot::render_args(args, &render_opts).await {
         Ok(pages) => {
             send_typst_pages(bot, msg, pages).await?;
@@ -3339,7 +3365,7 @@ async fn handle_sym(
         .reply_parameters(reply_params(msg))
         .await?;
 
-    let render_opts = typst_opts_from_env();
+    let render_opts = typst_opts_for(config, msg.chat.id).await;
     if let Ok(pages) = crate::math::render(
         &result.latex,
         crate::math::Dialect::Latex,

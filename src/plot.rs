@@ -116,37 +116,69 @@ pub fn parse_args(inner: &str) -> Result<PlotRequest, PlotError> {
 
 pub async fn render_args(input: &str, opts: &RenderOpts) -> Result<Vec<Vec<u8>>, PlotError> {
     let req = parse_args(input)?;
-    let doc = assemble(&req);
+    let doc = assemble(&req, opts);
     compile_doc(&doc, opts).await.map_err(PlotError::Render)
 }
 
 /// Build the typst document for a parsed request.
-pub fn assemble(req: &PlotRequest) -> String {
+pub fn assemble(req: &PlotRequest, opts: &RenderOpts) -> String {
     // 500 samples gives smooth curves across the kind of ranges chat
     // users actually pick (-10..10 of sin / cos / damped oscillators,
     // gaussians, sigmoids). Cetz-plot's default of 50 is jagged for
     // anything past one cycle.
     const SAMPLES: u32 = 500;
+    // Distinct curve colors per dialect; theme picks between palettes.
+    // Cetz `set-style` on `axes` re-tints the axis lines + tick labels.
+    let palette: &[&str] = match opts.theme {
+        crate::typst::Theme::Light => &[
+            "rgb(\"#1f77b4\")", // blue
+            "rgb(\"#d62728\")", // red
+            "rgb(\"#2ca02c\")", // green
+            "rgb(\"#9467bd\")", // purple
+            "rgb(\"#ff7f0e\")", // orange
+        ],
+        crate::typst::Theme::Dark => &[
+            "rgb(\"#82aaff\")",
+            "rgb(\"#ff6b6b\")",
+            "rgb(\"#64dd97\")",
+            "rgb(\"#c792ea\")",
+            "rgb(\"#ffb86c\")",
+        ],
+    };
     let mut body = String::new();
-    for expr in &req.exprs {
+    for (i, expr) in req.exprs.iter().enumerate() {
+        let color = palette[i % palette.len()];
         body.push_str(&format!(
-            "    plot.add(domain: ({lo}, {hi}), samples: {samples}, x => {expr})\n",
+            "    plot.add(domain: ({lo}, {hi}), samples: {samples}, style: (stroke: {color} + 1.5pt), x => {expr})\n",
             lo = req.lo,
             hi = req.hi,
             samples = SAMPLES,
+            color = color,
             expr = expr,
         ));
     }
+    let fg = opts.theme.fg_typst();
     format!(
-        "#set page(width: auto, height: auto, margin: 8pt)\n\
+        "#set page(width: auto, height: auto, margin: 8pt, fill: {bg})\n\
+         #set text(fill: {fg})\n\
          #import \"@preview/cetz:{cetz}\"\n\
          #import \"@preview/cetz-plot:{cp}\": plot\n\
          \n\
          #cetz.canvas({{\n\
-             plot.plot(size: (12, 8), {{\n\
+             import cetz.draw: set-style\n\
+             set-style(\n\
+                 axes: (stroke: {fg}, tick: (stroke: {fg}, label: (fill: {fg}))),\n\
+             )\n\
+             plot.plot(\n\
+                 size: (12, 8),\n\
+                 axis-style: \"scientific\",\n\
+                 {{\n\
          {body}\
-             }})\n\
+                 }},\n\
+             )\n\
          }})\n",
+        bg = opts.theme.bg_typst(),
+        fg = fg,
         cetz = CETZ_VERSION,
         cp = CETZ_PLOT_VERSION,
         body = body,
@@ -155,7 +187,7 @@ pub fn assemble(req: &PlotRequest) -> String {
 
 pub async fn render(input: &str, opts: &RenderOpts) -> Result<Vec<Vec<u8>>, PlotError> {
     let req = parse(input)?;
-    let doc = assemble(&req);
+    let doc = assemble(&req, opts);
     compile_doc(&doc, opts).await.map_err(PlotError::Render)
 }
 

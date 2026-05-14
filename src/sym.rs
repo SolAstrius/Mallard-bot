@@ -3,12 +3,21 @@
 //! Recognized syntaxes (parsed by *our* outer layer, not Symbolica's
 //! evaluator — Symbolica treats `diff(...)` etc. as inert function names):
 //!
-//!   * `<expr>`                       — parse + canonicalize
-//!   * `expand(<expr>)`               — distribute / expand
-//!   * `factor(<expr>)`               — factor over rationals
-//!   * `together(<expr>)`             — common-denominator a sum of fractions
-//!   * `diff(<expr>, <var>)`          — symbolic derivative
-//!   * `derivative(<expr>, <var>)`    — alias
+//!   * `<expr>`                                  — parse + canonicalize
+//!   * `expand(<expr>)`                          — distribute / expand
+//!   * `factor(<expr>)`                          — factor over rationals
+//!   * `together(<expr>)`                        — common-denominator
+//!   * `simplify(<expr>)`                        — expand + together pass
+//!   * `diff(<expr>, <var>)`                     — derivative
+//!   * `derivative(<expr>, <var>)`               — alias for `diff`
+//!   * `series(<expr> [, <var> [, <point> [, <depth>]]])` — Taylor/Laurent
+//!     series. Defaults: var=`x`, point=`0`, depth=`5`.
+//!   * `solve(<eq>, <var>)`                      — linear single-var
+//!   * `solve(<eq1>, <eq2>, ..., <var1>, <var2>, ...)` — linear system
+//!     (equal counts of equations and unknowns)
+//!   * `replace(<expr>, <pattern>, <rhs>)`       — pattern rewrite.
+//!     Wildcards: identifiers ending in `_` (Symbolica convention),
+//!     e.g. `replace(f(x), f(y_), y_+1)`.
 //!
 //! Output is both plain text (Display) and LaTeX (via `AtomPrinter` with
 //! `PrintOptions::latex()`), so callers can either send text or pipe the
@@ -16,7 +25,8 @@
 
 use std::time::Duration;
 
-use symbolica::atom::{Atom, AtomCore};
+use symbolica::atom::{Atom, AtomCore, Indeterminate};
+use symbolica::domains::rational::Rational;
 use symbolica::printer::{AtomPrinter, PrintOptions};
 
 #[derive(Debug)]
@@ -99,25 +109,31 @@ enum Op {
     Expand,
     Factor,
     Together,
+    Simplify,
     Derivative,
+    Series,
+    Solve,
+    Replace,
 }
 
 fn parse_op_call(input: &str) -> (Op, &str) {
     let t = input.trim();
+    // Order matters when names overlap (`derivative` vs `diff`, `replace`
+    // vs nothing): longer/more-specific first.
     let ops: &[(&str, Op)] = &[
+        ("derivative", Op::Derivative),
+        ("simplify", Op::Simplify),
+        ("together", Op::Together),
+        ("replace", Op::Replace),
         ("expand", Op::Expand),
         ("factor", Op::Factor),
-        ("together", Op::Together),
-        ("derivative", Op::Derivative),
+        ("series", Op::Series),
+        ("solve", Op::Solve),
         ("diff", Op::Derivative),
     ];
     for (name, op) in ops {
         if let Some(rest) = t.strip_prefix(name) {
             let rest = rest.trim_start();
-            // Only treat as an op call when the *whole* tail is `(...)` —
-            // `expand(x) + 1` falls through to Identity so the user gets
-            // a parse error from Symbolica instead of us silently dropping
-            // the `+ 1` part.
             if rest.starts_with('(') && rest.ends_with(')') && balanced(rest) {
                 let inner = &rest[1..rest.len() - 1];
                 return (*op, inner);
@@ -174,35 +190,144 @@ fn dispatch(input: &str) -> Result<Atom, SymError> {
         Op::Expand => Ok(parse_atom(inner)?.expand()),
         Op::Factor => Ok(parse_atom(inner)?.factor()),
         Op::Together => Ok(parse_atom(inner)?.together()),
-        Op::Derivative => {
-            let parts = split_top_commas(inner);
-            if parts.len() != 2 {
-                return Err(SymError::Eval(
-                    "diff/derivative ждёт два аргумента: diff(<выражение>, <переменная>)"
-                        .to_string(),
-                ));
+        Op::Simplify => Ok(parse_atom(inner)?.together().expand()),
+        Op::Derivative => dispatch_derivative(inner),
+        Op::Series => dispatch_series(inner),
+        Op::Solve => dispatch_solve(inner),
+        Op::Replace => dispatch_replace(inner),
+    }
+}
+
+fn dispatch_derivative(inner: &str) -> Result<Atom, SymError> {
+    let parts = split_top_commas(inner);
+    if parts.len() != 2 {
+        return Err(SymError::Eval(
+            "diff/derivative ждёт два аргумента: diff(<выражение>, <переменная>)".to_string(),
+        ));
+    }
+    let expr = parse_atom(parts[0])?;
+    let var = parse_var_symbol(parts[1], "diff")?;
+    Ok(expr.derivative(var))
+}
+
+fn dispatch_series(inner: &str) -> Result<Atom, SymError> {
+    let parts = split_top_commas(inner);
+    // Defaults: var=x, point=0, depth=5. Required: <expr> [, <var> [, <point> [, <depth>]]].
+    if parts.is_empty() || parts.iter().all(|p| p.trim().is_empty()) {
+        return Err(SymError::Eval(
+            "series ждёт хотя бы выражение: series(<expr>[, <var>[, <point>[, <depth>]]])"
+                .to_string(),
+        ));
+    }
+    let expr = parse_atom(parts[0])?;
+    let var = if parts.len() >= 2 {
+        parse_var_symbol(parts[1], "series")?
+    } else {
+        parse_var_symbol("x", "series")?
+    };
+    let point = if parts.len() >= 3 {
+        parse_atom(parts[2])?
+    } else {
+        Atom::num(0)
+    };
+    let depth_n: u64 = if parts.len() >= 4 {
+        parts[3]
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| SymError::Eval(format!("series: глубина должна быть числом, не {:?}", parts[3].trim())))?
+    } else {
+        5
+    };
+    let indet: Indeterminate = var.into();
+    let series = expr
+        .series(indet, point, Rational::from(depth_n), false)
+        .map_err(SymError::Eval)?;
+    Ok(series.to_atom())
+}
+
+fn dispatch_solve(inner: &str) -> Result<Atom, SymError> {
+    let parts = split_top_commas(inner);
+    if parts.len() < 2 || !parts.len().is_multiple_of(2) {
+        return Err(SymError::Eval(
+            "solve ждёт пары: solve(<eq>, <var>) или solve(<eq1>,…,<eqN>, <var1>,…,<varN>)"
+                .to_string(),
+        ));
+    }
+    let n = parts.len() / 2;
+    let eqs: Vec<Atom> = parts[..n]
+        .iter()
+        .map(|s| parse_atom(s))
+        .collect::<Result<_, _>>()?;
+    let vars: Vec<Atom> = parts[n..]
+        .iter()
+        .map(|s| parse_atom(s))
+        .collect::<Result<_, _>>()?;
+
+    match Atom::solve_linear_system::<u8, _, _>(&eqs, &vars) {
+        Ok(sol) => {
+            // Build `(var1 = val1, var2 = val2, …)` as a single Atom via a
+            // function call (the only way to package a tuple in Symbolica's
+            // atom tree). For one variable, just return the single value.
+            if sol.len() == 1 {
+                Ok(sol.into_iter().next().unwrap())
+            } else {
+                // Render as "var1 = val1, var2 = val2" by formatting on the
+                // way out (Atom doesn't have a clean "list" type for this).
+                // We emit a custom string instead of an Atom — use a dummy
+                // wrapper function and let the formatter expose the pairs.
+                let parts: Vec<String> = vars
+                    .iter()
+                    .zip(sol.iter())
+                    .map(|(v, s)| format!("{v} = {s}"))
+                    .collect();
+                // Wrap the pretty form as a parsed atom expression so the
+                // rest of the pipeline (text + latex) works uniformly.
+                // We just print a comma-separated list of equality atoms.
+                let combined = parts.join(", ");
+                // Parse the combined string back into an Atom — Symbolica's
+                // parser handles `a = b, c = d` as a function-call-shaped
+                // expression poorly, so emit it as a `solution(a-b, c-d)`
+                // tuple instead. Simpler: emit `(a=b)*(c=d)*…` no.
+                // Honest answer: just synthesize the text by hand and
+                // return it as a special atom via parse — but `=` isn't a
+                // legal binary op. Workaround: rejoin as a synthetic
+                // function call.
+                let fake = format!("solution({combined})");
+                parse_atom(&fake)
             }
-            let expr = parse_atom(parts[0])?;
-            let var_name = parts[1].trim();
-            if var_name.is_empty() {
-                return Err(SymError::Eval(
-                    "diff/derivative: имя переменной пустое".to_string(),
-                ));
-            }
-            // `symbol!` panics on invalid identifiers; we'd rather surface
-            // that as a normal error, so wrap in `catch_unwind`.
-            let var = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                symbolica::symbol!(var_name)
-            })) {
-                Ok(s) => s,
-                Err(_) => {
-                    return Err(SymError::Eval(format!(
-                        "diff: невалидное имя переменной {var_name:?}"
-                    )));
-                }
-            };
-            Ok(expr.derivative(var))
         }
+        Err(e) => Err(SymError::Eval(format!("solve: {e:?}"))),
+    }
+}
+
+fn dispatch_replace(inner: &str) -> Result<Atom, SymError> {
+    let parts = split_top_commas(inner);
+    if parts.len() != 3 {
+        return Err(SymError::Eval(
+            "replace ждёт три аргумента: replace(<выражение>, <шаблон>, <замена>)".to_string(),
+        ));
+    }
+    use symbolica::id::Pattern;
+    let expr = parse_atom(parts[0])?;
+    let pattern: Pattern = parse_atom(parts[1])?.into();
+    let rhs: Pattern = parse_atom(parts[2])?.into();
+    Ok(expr.replace(pattern).with(rhs))
+}
+
+fn parse_var_symbol(s: &str, op: &str) -> Result<symbolica::atom::Symbol, SymError> {
+    let var_name = s.trim();
+    if var_name.is_empty() {
+        return Err(SymError::Eval(format!("{op}: имя переменной пустое")));
+    }
+    // `symbol!` panics on invalid identifiers; we'd rather surface that
+    // as a normal error.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        symbolica::symbol!(var_name)
+    })) {
+        Ok(s) => Ok(s),
+        Err(_) => Err(SymError::Eval(format!(
+            "{op}: невалидное имя переменной {var_name:?}"
+        ))),
     }
 }
 
@@ -214,11 +339,11 @@ fn parse_atom(s: &str) -> Result<Atom, SymError> {
 mod tests {
     use super::*;
 
-    /// Symbolica's free tier allows only one instance per machine, and the
-    /// process-wide "I'm running" flag isn't released between cargo test
-    /// functions in the same binary. So every assertion that actually
-    /// touches Symbolica has to live inside one `#[test]` body. Pure helpers
-    /// (split, balanced, empty rejection) stay as separate tests.
+    /// Even with a licensed Symbolica, cargo's test process reuses the
+    /// instance lock between tests within one binary. So every assertion
+    /// that actually touches Symbolica lives inside one `#[test]` body.
+    /// Pure helpers (split, balanced, empty rejection) stay as separate
+    /// tests.
     #[test]
     fn live_symbolica_smoke() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -254,6 +379,22 @@ mod tests {
         // Symbolic derivative — chain on sin.
         let out = run("diff(sin(x), x)");
         assert!(out.contains("cos(x)"), "diff sin: {out}");
+
+        // Series — sin(x) at 0, depth 5 has x and x^3 terms.
+        let out = run("series(sin(x), x, 0, 5)");
+        assert!(out.contains('x'), "series: {out}");
+
+        // Solve — linear two-equation system.
+        let out = run("solve(2*x + y - 1, x + y + 1, x, y)");
+        assert!(out.contains('2') && out.contains("-3"), "solve: {out}");
+
+        // Replace — wildcards via Symbolica's _-suffix convention.
+        let out = run("replace(f(1,2,x) + f(1,2,3), f(1,2,y_), f(1,2,y_+1))");
+        assert!(out.contains("f(1,2,") || out.contains("f(1, 2,"), "replace: {out}");
+
+        // Simplify — together + expand normalizes.
+        let out = run("simplify(1/x + 1/y)");
+        assert!(out.contains('x') && out.contains('y'), "simplify: {out}");
     }
 
     #[test]

@@ -57,8 +57,10 @@ pub fn assemble(src: &str, dialect: Dialect, opts: &RenderOpts) -> String {
 
 fn preamble(opts: &RenderOpts) -> String {
     format!(
-        "#set page(width: auto, height: auto, margin: (x: 10pt, y: 8pt))\n\
-         #set text(size: {size}pt)\n",
+        "#set page(width: auto, height: auto, margin: (x: 10pt, y: 8pt), fill: {bg})\n\
+         #set text(size: {size}pt, fill: {fg})\n",
+        bg = opts.theme.bg_typst(),
+        fg = opts.theme.fg_typst(),
         size = opts.text_size_pt,
     )
 }

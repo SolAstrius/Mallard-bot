@@ -16,6 +16,45 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+/// Light or dark theme — feeds into both the typst preamble (math /
+/// plot pages) and the pad-to-minimum background fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// Typst color literal for the page background.
+    pub fn bg_typst(self) -> &'static str {
+        match self {
+            Self::Light => "white",
+            Self::Dark => "rgb(\"#1e1e1e\")",
+        }
+    }
+    /// Typst color literal for foreground (text, curves, axes).
+    pub fn fg_typst(self) -> &'static str {
+        match self {
+            Self::Light => "black",
+            Self::Dark => "rgb(\"#e6e6e6\")",
+        }
+    }
+    /// RGBA fill used by `pad_to_minimum` when extending the canvas.
+    pub fn pad_rgba(self) -> [u8; 4] {
+        match self {
+            Self::Light => [255, 255, 255, 255],
+            Self::Dark => [30, 30, 30, 255],
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderOpts {
     pub ppi: u32,
@@ -38,6 +77,7 @@ pub struct RenderOpts {
     /// Telegram media groups accept up to 10 items. Renders past that get
     /// rejected with `TooManyPages` rather than silently truncated.
     pub max_pages: usize,
+    pub theme: Theme,
 }
 
 impl Default for RenderOpts {
@@ -57,6 +97,7 @@ impl Default for RenderOpts {
             max_dim_px: 4096,
             max_bytes_per_page: 8 * 1024 * 1024,
             max_pages: 10,
+            theme: Theme::Light,
         }
     }
 }
@@ -223,7 +264,7 @@ fn process_page(bytes: Vec<u8>, opts: &RenderOpts) -> Result<Vec<u8>, RenderErro
         let out_w = w.max(opts.min_width_px);
         let out_h = h.max(opts.min_height_px);
         let mut canvas =
-            image::RgbaImage::from_pixel(out_w, out_h, image::Rgba([255, 255, 255, 255]));
+            image::RgbaImage::from_pixel(out_w, out_h, image::Rgba(opts.theme.pad_rgba()));
         let dx = ((out_w - w) / 2) as i64;
         let dy = ((out_h - h) / 2) as i64;
         image::imageops::overlay(&mut canvas, &img.to_rgba8(), dx, dy);
