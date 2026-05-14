@@ -305,8 +305,10 @@ const HELP_FEATURE: &str = "/feature — управление флагами к�
 const HELP_DNS: &str = "/dns — DNS-тулчейн для sysadmin'ов.\n\
 Подкоманды:\n\
 * /dns <name> [type] [@resolver] — обычный lookup. Тип по умолчанию — A. Резолвер — первый из dns.resolvers.* или конкретная IP/хост через @.\n\
-* /dns prop <name> [type] — таблица пропагации: один запрос на все включённые резолверы, расхождения помечены ⚠️.\n\
-* /dns sec <name> — валидация DNSSEC, плюс наличие DS/DNSKEY на апексе зоны.\n\
+* /dns prop <name> [type] — таблица пропагации: один запрос на все включённые резолверы, расхождения помечены ⚠️ + сгруппированы [A]/[B]/[C].\n\
+* /dns sec <name> — валидация DNSSEC: signed/insecure/bogus, плюс DS/DNSKEY на апексе.\n\
+* /dns ns <domain> — опрашивает каждый авторитетный NS, ищет split-brain.\n\
+* /dns soa <domain> — сравнивает SOA serial у каждого NS, ловит отставшие реплики.\n\
 * /dns spf <domain> — раскрыть SPF: ходит по include:/redirect=, считает DNS-lookups против лимита RFC 7208 (10).\n\
 * /dns dmarc <domain> — разобрать DMARC, перевести каждый тег на человеческий.\n\
 * /dns mx <domain> — список MX + PTR + STARTTLS-зонд (subject/issuer/срок) + наличие DANE/TLSA.\n\

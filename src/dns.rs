@@ -367,6 +367,8 @@ pub async fn handle(rest: &str, rules: &[(String, String)]) -> String {
         "help" | "?" => help_text().to_string(),
         "prop" => cmd_prop(&tokens[1..], rules).await,
         "sec" => cmd_sec(&tokens[1..], rules).await,
+        "ns" => cmd_ns(&tokens[1..], rules).await,
+        "soa" => cmd_soa(&tokens[1..], rules).await,
         "spf" => cmd_spf(&tokens[1..], rules).await,
         "dmarc" => cmd_dmarc(&tokens[1..], rules).await,
         "mx" => cmd_mx(&tokens[1..], rules).await,
@@ -382,6 +384,8 @@ fn help_text() -> &'static str {
      * /dns <name> [type] [@resolver] — обычный lookup\n\
      * /dns prop <name> [type] — таблица пропагации\n\
      * /dns sec <name> — валидация DNSSEC-цепочки\n\
+     * /dns ns <domain> — опрос каждого авторитетного NS, поиск split-brain\n\
+     * /dns soa <domain> — сравнение serial у каждого NS\n\
      * /dns spf <domain> — раскрыть SPF, посчитать lookups\n\
      * /dns dmarc <domain> — разобрать DMARC-политику\n\
      * /dns mx <domain> — MX + PTR + STARTTLS + DANE\n\
@@ -736,6 +740,227 @@ fn zone_apex(name: &str) -> String {
         return n.to_string();
     }
     labels[labels.len() - 2..].join(".")
+}
+
+// ---------- /dns ns + /dns soa — Tier 3 authoritative cross-checks ----------
+
+/// Discover the authoritative nameservers for `domain` via `upstream_ip`
+/// and resolve each to an IPv4. Returns (ns_hostname, ip).
+async fn authoritative_ns(
+    upstream_ip: IpAddr,
+    domain: &str,
+    timeout: Duration,
+) -> Vec<(String, IpAddr)> {
+    let ns_q = query_at(upstream_ip, domain, RecordType::NS, timeout).await;
+    if ns_q.rows.is_empty() {
+        return Vec::new();
+    }
+    let hosts: Vec<String> = ns_q
+        .rows
+        .iter()
+        .map(|r| r.value.trim_end_matches('.').to_string())
+        .collect();
+    let futs = hosts.iter().map(|h| {
+        let h = h.clone();
+        async move {
+            let a = query_at(upstream_ip, &h, RecordType::A, timeout).await;
+            let ip = a
+                .rows
+                .into_iter()
+                .find_map(|r| r.value.parse::<IpAddr>().ok());
+            (h, ip)
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+    results
+        .into_iter()
+        .filter_map(|(h, ip)| ip.map(|ip| (h, ip)))
+        .collect()
+}
+
+async fn cmd_soa(tokens: &[&str], rules: &[(String, String)]) -> String {
+    let domain = match tokens.first() {
+        Some(d) => *d,
+        None => return "формат: /dns soa <domain>".to_string(),
+    };
+    let timeout = parallel_timeout(rules);
+    let pick = enabled_upstreams(rules)
+        .first()
+        .copied()
+        .unwrap_or(&UPSTREAMS[0]);
+    let auths = authoritative_ns(pick.ips[0], domain, timeout).await;
+    if auths.is_empty() {
+        return format!("; {} — нет NS-записей (вероятно, не апекс зоны)\n", domain);
+    }
+
+    // Query SOA from every authoritative in parallel.
+    let futs = auths.iter().map(|(ns, ip)| {
+        let ns = ns.clone();
+        let ip = *ip;
+        let domain = domain.to_string();
+        async move {
+            let q = query_at(ip, &domain, RecordType::SOA, timeout).await;
+            (ns, ip, q)
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+
+    // SOA rdata format: "mname rname serial refresh retry expire minimum".
+    // Serial is the 3rd whitespace-separated token.
+    let serials: Vec<Option<u32>> = results
+        .iter()
+        .map(|(_, _, q)| {
+            q.rows
+                .first()
+                .and_then(|r| r.value.split_whitespace().nth(2))
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .collect();
+
+    // Majority serial = the most-frequent one.
+    let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for s in serials.iter().flatten() {
+        *counts.entry(*s).or_default() += 1;
+    }
+    let majority: Option<u32> = counts
+        .iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(s, _)| *s);
+
+    let unanimous = counts.len() <= 1
+        && serials.iter().all(|s| s.is_some());
+    let mut out = format!(
+        "; SOA-сверка для {} ({} авторитетных NS)\n",
+        domain,
+        auths.len()
+    );
+    if unanimous {
+        let m = majority.map(|s| s.to_string()).unwrap_or_default();
+        out.push_str(&format!("; все NS на одном serial: {m} ✅\n"));
+    } else {
+        out.push_str(&format!(
+            "; ⚠️ расхождение serial — {} разных значений\n",
+            counts.len()
+        ));
+    }
+    for ((ns, ip, q), serial) in results.iter().zip(serials.iter()) {
+        let badge = if q.is_hard_error() {
+            "❌".to_string()
+        } else if *serial == majority {
+            "✅".to_string()
+        } else {
+            "⚠️".to_string()
+        };
+        let serial_str = serial
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                q.error
+                    .clone()
+                    .unwrap_or_else(|| "?".to_string())
+            });
+        let rtt_str = format!("{:>4}ms", q.rtt.as_millis());
+        out.push_str(&format!(
+            "{badge} {:<32} {:<15} {} — serial {}\n",
+            ns, ip, rtt_str, serial_str
+        ));
+    }
+    out
+}
+
+async fn cmd_ns(tokens: &[&str], rules: &[(String, String)]) -> String {
+    let domain = match tokens.first() {
+        Some(d) => *d,
+        None => return "формат: /dns ns <domain>".to_string(),
+    };
+    let timeout = parallel_timeout(rules);
+    let pick = enabled_upstreams(rules)
+        .first()
+        .copied()
+        .unwrap_or(&UPSTREAMS[0]);
+    let auths = authoritative_ns(pick.ips[0], domain, timeout).await;
+    if auths.is_empty() {
+        return format!("; {} — нет NS-записей\n", domain);
+    }
+
+    // Ask each NS for its own NS list. Split-brain / mid-rollover shows
+    // up as different NS sets returned across the cohort.
+    let futs = auths.iter().map(|(ns, ip)| {
+        let ns = ns.clone();
+        let ip = *ip;
+        let domain = domain.to_string();
+        async move {
+            let q = query_at(ip, &domain, RecordType::NS, timeout).await;
+            (ns, ip, q)
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+
+    // Cohort the results by the normalized NS set each server returns.
+    let mut cohort_keys: Vec<String> = Vec::new();
+    let mut cohort_members: Vec<Vec<usize>> = Vec::new();
+    for (i, (_, _, q)) in results.iter().enumerate() {
+        let mut vals: Vec<String> = q.rows.iter().map(|r| r.value.to_lowercase()).collect();
+        vals.sort();
+        let key = if let Some(err) = &q.error {
+            format!("!{err}")
+        } else if vals.is_empty() {
+            "(empty)".to_string()
+        } else {
+            vals.join(",")
+        };
+        match cohort_keys.iter().position(|k| k == &key) {
+            Some(idx) => cohort_members[idx].push(i),
+            None => {
+                cohort_keys.push(key);
+                cohort_members.push(vec![i]);
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..cohort_keys.len()).collect();
+    order.sort_by(|a, b| cohort_members[*b].len().cmp(&cohort_members[*a].len()));
+    let mut letter: Vec<char> = vec![' '; results.len()];
+    for (rank, idx) in order.iter().enumerate() {
+        let l = char::from(b'A' + rank as u8);
+        for &i in &cohort_members[*idx] {
+            letter[i] = l;
+        }
+    }
+
+    let unanimous = cohort_keys.len() == 1;
+    let mut out = format!(
+        "; NS-самотест для {} ({} авторитетных NS)\n",
+        domain,
+        auths.len()
+    );
+    if unanimous {
+        out.push_str("; все NS возвращают одинаковый список ✅\n");
+    } else {
+        out.push_str(&format!(
+            "; ⚠️ NS не согласны: {} разных набора\n",
+            cohort_keys.len()
+        ));
+    }
+    for (i, (ns, ip, q)) in results.iter().enumerate() {
+        let l = letter[i];
+        let badge = if q.is_hard_error() {
+            "❌".to_string()
+        } else if unanimous {
+            "✅".to_string()
+        } else if l == 'A' {
+            format!("[{l}] ✅")
+        } else {
+            format!("[{l}] ⚠️")
+        };
+        out.push_str(&format!("{badge} {} ({})\n", ns, ip));
+        if let Some(err) = &q.error {
+            out.push_str(&format!("   {err}\n"));
+            continue;
+        }
+        for r in &q.rows {
+            out.push_str(&format!("   {}\n", r.value.trim_end_matches('.')));
+        }
+    }
+    out
 }
 
 // ---------- /dns spf, dmarc, mx, mta, caa — Tier 2 ----------
