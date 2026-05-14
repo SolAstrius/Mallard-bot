@@ -760,12 +760,16 @@ async fn cmd_mx(tokens: &[&str], rules: &[(String, String)]) -> String {
         .first()
         .copied()
         .unwrap_or(&UPSTREAMS[0]);
-    let q = query_at(pick.ips[0], domain, RecordType::MX, timeout).await;
+    let upstream_ip = pick.ips[0];
+    let q = query_at(upstream_ip, domain, RecordType::MX, timeout).await;
     if q.rows.is_empty() {
         return format!(
             "; {} — нет MX{}\n",
             domain,
-            q.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default()
+            q.error
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
         );
     }
     let mut mxes: Vec<(u16, String)> = q
@@ -780,31 +784,53 @@ async fn cmd_mx(tokens: &[&str], rules: &[(String, String)]) -> String {
         .collect();
     mxes.sort_by_key(|(p, _)| *p);
 
+    // Probe each MX host in parallel. The slow leg is the TLS handshake;
+    // serializing 5 MX × ~1–3s adds up fast.
+    let probes = mxes.iter().map(|(pref, host)| {
+        let host = host.clone();
+        let pref = *pref;
+        async move {
+            let block = probe_mx_host(upstream_ip, &host, timeout).await;
+            (pref, host, block)
+        }
+    });
+    let results = futures::future::join_all(probes).await;
+
     let mut out = format!("; MX {} ({} записей)\n", domain, mxes.len());
-    for (pref, host) in &mxes {
+    for (pref, host, block) in results {
         out.push_str(&format!("\n[{}] {}\n", pref, host));
-        // Resolve A/AAAA for the MX host.
-        let a = query_at(pick.ips[0], host, RecordType::A, timeout).await;
-        for r in &a.rows {
-            out.push_str(&format!("   A     {} (ttl {})\n", r.value, r.ttl));
-            // PTR back.
-            let ptr_name = ptr_name_for(&r.value);
-            let ptr = query_at(pick.ips[0], &ptr_name, RecordType::PTR, timeout).await;
-            if let Some(p) = ptr.rows.first() {
-                out.push_str(&format!("   PTR   {}\n", p.value));
-            }
+        out.push_str(&block);
+    }
+    out
+}
+
+/// Per-MX probe: parallel A + TLSA lookups, then a PTR per resolved
+/// address and a STARTTLS handshake. Returns the formatted block for
+/// that host (no header line — caller adds `[pref] host`).
+async fn probe_mx_host(upstream_ip: IpAddr, host: &str, timeout: Duration) -> String {
+    let a_fut = query_at(upstream_ip, host, RecordType::A, timeout);
+    let tlsa_name = format!("_25._tcp.{}", host);
+    let tlsa_fut = query_at(upstream_ip, &tlsa_name, RecordType::TLSA, timeout);
+    let tls_fut = probe_starttls(host, timeout);
+    let (a, tlsa, tls) = futures::join!(a_fut, tlsa_fut, tls_fut);
+
+    let mut out = String::new();
+    // A records (+ PTR per address, sequential per address since PTR
+    // depends on the resolved A and the addresses are usually 1).
+    for r in &a.rows {
+        out.push_str(&format!("   A     {} (ttl {})\n", r.value, r.ttl));
+        let ptr_name = ptr_name_for(&r.value);
+        let ptr = query_at(upstream_ip, &ptr_name, RecordType::PTR, timeout).await;
+        if let Some(p) = ptr.rows.first() {
+            out.push_str(&format!("   PTR   {}\n", p.value));
         }
-        // STARTTLS probe (skip in tests / when network is unreachable).
-        match probe_starttls(host, timeout).await {
-            Ok(info) => out.push_str(&format!("   TLS   {}\n", info)),
-            Err(e) => out.push_str(&format!("   TLS   ❌ {}\n", e)),
-        }
-        // DANE / TLSA at _25._tcp.<host>.
-        let tlsa_name = format!("_25._tcp.{}", host);
-        let tlsa = query_at(pick.ips[0], &tlsa_name, RecordType::TLSA, timeout).await;
-        if !tlsa.rows.is_empty() {
-            out.push_str(&format!("   DANE  ✅ {} TLSA записей\n", tlsa.rows.len()));
-        }
+    }
+    match tls {
+        Ok(info) => out.push_str(&format!("   TLS   {}\n", info)),
+        Err(e) => out.push_str(&format!("   TLS   ❌ {}\n", e)),
+    }
+    if !tlsa.rows.is_empty() {
+        out.push_str(&format!("   DANE  ✅ {} TLSA записей\n", tlsa.rows.len()));
     }
     out
 }
@@ -827,6 +853,11 @@ fn ptr_name_for(ip: &str) -> String {
 
 /// SMTP STARTTLS probe: TCP-connect to port 25, banner, EHLO, STARTTLS,
 /// TLS handshake, pull the leaf cert. Returns one-line summary.
+///
+/// Single TCP connect — we do the SMTP dance on the split halves, then
+/// reunite for the TLS upgrade. The 220-STARTTLS reply is one line and
+/// the server is required to stay silent until the TLS handshake begins,
+/// so `BufReader::into_inner` discarding its buffer is safe here.
 async fn probe_starttls(host: &str, timeout: Duration) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
@@ -835,62 +866,46 @@ async fn probe_starttls(host: &str, timeout: Duration) -> Result<String, String>
     let stream = tokio::time::timeout(timeout, TcpStream::connect(&target))
         .await
         .map_err(|_| "TCP timeout".to_string())?
-        .map_err(|e| format!("TCP: {e}"))?;
+        .map_err(|e| classify_tcp_error(&e))?;
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
-    let mut line = String::new();
 
-    // Read banner until 220
-    rd.read_line(&mut line).await.map_err(|e| e.to_string())?;
-    if !line.starts_with("220") {
-        return Err(format!("банер не 220: {}", line.trim()));
-    }
-    wr.write_all(b"EHLO mallard-bot\r\n").await.map_err(|e| e.to_string())?;
-    // drain EHLO response
+    // Banner: lines until one starts with "220 " (terminal greeting).
     loop {
         let mut l = String::new();
-        rd.read_line(&mut l).await.map_err(|e| e.to_string())?;
-        if l.starts_with("250 ") || l.is_empty() {
+        let n = rd.read_line(&mut l).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("сервер закрыл коннект до баннера".to_string());
+        }
+        if !l.starts_with("220") {
+            return Err(format!("банер не 220: {}", l.trim()));
+        }
+        if l.starts_with("220 ") {
             break;
         }
     }
-    wr.write_all(b"STARTTLS\r\n").await.map_err(|e| e.to_string())?;
+    wr.write_all(b"EHLO mallard-bot\r\n")
+        .await
+        .map_err(|e| e.to_string())?;
+    // Drain EHLO response — lines starting with "250-" continue, "250 " ends.
+    loop {
+        let mut l = String::new();
+        let n = rd.read_line(&mut l).await.map_err(|e| e.to_string())?;
+        if n == 0 || l.starts_with("250 ") {
+            break;
+        }
+    }
+    wr.write_all(b"STARTTLS\r\n")
+        .await
+        .map_err(|e| e.to_string())?;
     let mut r = String::new();
     rd.read_line(&mut r).await.map_err(|e| e.to_string())?;
     if !r.starts_with("220") {
         return Err(format!("STARTTLS отказ: {}", r.trim()));
     }
 
-    // Re-assemble the split stream for TLS upgrade. We can't easily
-    // re-unify a split TcpStream into a single TcpStream; reconnect for
-    // the TLS leg. Cheaper than rolling a custom AsyncRead/Write merger.
-    drop(rd);
-    drop(wr);
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(&target))
-        .await
-        .map_err(|_| "TCP timeout (2)".to_string())?
-        .map_err(|e| format!("TCP (2): {e}"))?;
-    let (rd2, mut wr2) = stream.into_split();
-    let mut rd2 = BufReader::new(rd2);
-    let mut _l = String::new();
-    rd2.read_line(&mut _l).await.map_err(|e| e.to_string())?; // banner
-    wr2.write_all(b"EHLO mallard-bot\r\n").await.map_err(|e| e.to_string())?;
-    loop {
-        let mut l = String::new();
-        rd2.read_line(&mut l).await.map_err(|e| e.to_string())?;
-        if l.starts_with("250 ") || l.is_empty() {
-            break;
-        }
-    }
-    wr2.write_all(b"STARTTLS\r\n").await.map_err(|e| e.to_string())?;
-    let mut s = String::new();
-    rd2.read_line(&mut s).await.map_err(|e| e.to_string())?;
-    if !s.starts_with("220") {
-        return Err(format!("STARTTLS отказ (2): {}", s.trim()));
-    }
-
-    // Re-glue into TcpStream for tokio-rustls.
-    let socket: TcpStream = rd2.into_inner().reunite(wr2).map_err(|e| e.to_string())?;
+    // Reunite halves into a single TcpStream for the TLS handshake.
+    let socket: TcpStream = rd.into_inner().reunite(wr).map_err(|e| e.to_string())?;
 
     let mut root = rustls::RootCertStore::empty();
     root.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -916,11 +931,28 @@ async fn probe_starttls(host: &str, timeout: Duration) -> Result<String, String>
     let subject = parsed.subject().to_string();
     let issuer = parsed.issuer().to_string();
     let not_after = parsed.validity().not_after.to_string();
-    let proto = conn.protocol_version().map(|v| format!("{:?}", v)).unwrap_or_default();
+    let proto = conn
+        .protocol_version()
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_default();
     Ok(format!(
-        "✅ {} | subject={} | issuer={} | до {}",
-        proto, subject, issuer, not_after
+        "✅ {proto} | subject={subject} | issuer={issuer} | до {not_after}"
     ))
+}
+
+/// Translate a TCP-connect `io::Error` into a short status string. Stay
+/// neutral on root cause — ENETUNREACH can be the destination not running
+/// SMTP, the bot's egress being filtered, or routing in between. Leave
+/// the diagnosis to the human.
+fn classify_tcp_error(e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused => "TCP refused (порт 25 закрыт)".to_string(),
+        ErrorKind::TimedOut => "TCP timeout".to_string(),
+        _ if e.raw_os_error() == Some(101) => "TCP: network unreachable".to_string(),
+        _ if e.raw_os_error() == Some(113) => "TCP: no route to host".to_string(),
+        _ => format!("TCP: {e}"),
+    }
 }
 
 async fn cmd_mta(tokens: &[&str], rules: &[(String, String)]) -> String {
