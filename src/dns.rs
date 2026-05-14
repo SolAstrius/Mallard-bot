@@ -231,6 +231,24 @@ impl QueryResult {
             error: Some(msg.into()),
         }
     }
+
+    /// "NXDOMAIN" / "no records" are valid resolver responses (the name
+    /// just has nothing of that type). Distinguish them from genuine
+    /// failures (SERVFAIL, timeout, connection error) so renderers don't
+    /// mark empty-but-OK results as red.
+    fn is_soft_empty(&self) -> bool {
+        match &self.error {
+            Some(e) => e == "NXDOMAIN" || e == "no records",
+            None => self.rows.is_empty(),
+        }
+    }
+
+    fn is_hard_error(&self) -> bool {
+        match &self.error {
+            Some(e) => e != "NXDOMAIN" && e != "no records",
+            None => false,
+        }
+    }
 }
 
 /// Run one query against one upstream IP. Captures RTT.
@@ -547,9 +565,15 @@ async fn cmd_prop(tokens: &[&str], rules: &[(String, String)]) -> String {
                 format!("{}={}", letter, cohort_members[*cohort_idx].len())
             })
             .collect();
+        // Russian noun-form depends on count: 1 группа, 2-4 группы, 5+ групп.
+        let n = cohort_keys.len();
+        let word = match n % 10 {
+            1 if n % 100 != 11 => "группа",
+            2..=4 if !(12..=14).contains(&(n % 100)) => "группы",
+            _ => "групп",
+        };
         out.push_str(&format!(
-            "; {} групп ответов: {} ⚠️\n",
-            cohort_keys.len(),
+            "; {n} {word} ответов: {} ⚠️\n",
             summary.join(" ")
         ));
     }
@@ -622,16 +646,18 @@ async fn cmd_sec(tokens: &[&str], rules: &[(String, String)]) -> String {
     let (lookup_res, ds_q, dnskey_q) = futures::join!(lookup_fut, ds_fut, dnskey_fut);
     let rtt = start.elapsed();
 
-    let signed_at_parent = ds_q.error.is_none() && !ds_q.rows.is_empty();
-    let signed_at_zone = dnskey_q.error.is_none() && !dnskey_q.rows.is_empty();
-    let zone_signed = signed_at_parent && signed_at_zone;
+    // The single-question test is "does the parent zone publish a DS?"
+    // If yes, the zone *claims* to be signed and the validating lookup
+    // result tells us secure vs bogus. If no, the zone is insecure and
+    // the lookup just succeeds plainly.
+    let zone_claims_signed = !ds_q.is_soft_empty() && !ds_q.is_hard_error();
 
     let mut out = format!("; {} — DNSSEC через {}\n", name, pick.label);
     match lookup_res {
         Err(_) => out.push_str(&format!("⌛ таймаут {} ms\n", rtt.as_millis())),
-        Ok(Err(e)) if zone_signed => {
-            // The zone IS signed, and the validating resolver bailed.
-            // That's a real DNSSEC failure.
+        Ok(Err(e)) if zone_claims_signed => {
+            // Zone is signed at the parent, and the validating resolver
+            // refused to return an answer — that's a real DNSSEC failure.
             out.push_str(&format!("❌ цепочка сломана (bogus): {e}\n"));
         }
         Ok(Err(e)) => {
@@ -640,7 +666,7 @@ async fn cmd_sec(tokens: &[&str], rules: &[(String, String)]) -> String {
             out.push_str(&format!("⚠️ {e}\n"));
         }
         Ok(Ok(lookup)) => {
-            if zone_signed {
+            if zone_claims_signed {
                 out.push_str("✅ цепочка валидна (signed)\n");
             } else {
                 out.push_str("ℹ️ зона не подписана DNSSEC (insecure)\n");
@@ -1252,27 +1278,24 @@ async fn cmd_caa(tokens: &[&str], rules: &[(String, String)]) -> String {
     let mut out = format!("; CAA-обход {}\n", name);
     let mut effective: Option<&(String, QueryResult)> = None;
     for r in &results {
-        if effective.is_none() && r.1.error.is_none() && !r.1.rows.is_empty() {
+        if effective.is_none() && !r.1.rows.is_empty() {
             effective = Some(r);
         }
-        let badge = if r.1.error.is_some() {
+        let badge = if r.1.is_hard_error() {
             "❌"
-        } else if r.1.rows.is_empty() {
-            "·"
-        } else {
+        } else if !r.1.rows.is_empty() {
             "✅"
+        } else {
+            "·"
         };
-        out.push_str(&format!(
-            "{badge} {} — {}\n",
-            r.0,
-            if let Some(err) = &r.1.error {
-                err.clone()
-            } else if r.1.rows.is_empty() {
-                "нет CAA".to_string()
-            } else {
-                format!("{} записей", r.1.rows.len())
-            }
-        ));
+        let detail = if r.1.is_hard_error() {
+            r.1.error.clone().unwrap_or_default()
+        } else if r.1.rows.is_empty() {
+            "нет CAA".to_string()
+        } else {
+            format!("{} записей", r.1.rows.len())
+        };
+        out.push_str(&format!("{badge} {} — {}\n", r.0, detail));
     }
     if let Some((winner, q)) = effective {
         out.push_str(&format!("\n; действует CAA с {}\n", winner));
