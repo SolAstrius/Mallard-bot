@@ -175,6 +175,42 @@ fn rdata_to_string(data: &RData) -> String {
             let val = String::from_utf8_lossy(&c.value);
             format!("{} {} \"{}\"", c.issuer_critical as u8, c.tag, val)
         }
+        RData::DNSSEC(d) => format_dnssec_rdata(d),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Best-effort short rendering for DNSSEC-family records. The full
+/// signature/key blobs are noise inside a chat reply; show the
+/// structural fields and a truncated fingerprint instead of dumping
+/// hundreds of bytes through `Debug`.
+fn format_dnssec_rdata(d: &hickory_proto::dnssec::rdata::DNSSECRData) -> String {
+    use hickory_proto::dnssec::rdata::DNSSECRData as D;
+    match d {
+        D::RRSIG(s) => {
+            // RRSIG derefs to SIG, whose `input()` returns a SigInput.
+            let i = s.input();
+            format!(
+                "RRSIG {} alg={:?} labels={} ttl={} kt={} signer={}",
+                i.type_covered,
+                i.algorithm,
+                i.num_labels,
+                i.original_ttl,
+                i.key_tag,
+                i.signer_name
+            )
+        }
+        D::DNSKEY(k) => format!(
+            "DNSKEY flags={} kt={}",
+            k.flags(),
+            k.calculate_key_tag().unwrap_or(0)
+        ),
+        D::DS(ds) => format!(
+            "DS kt={} alg={:?} digest={:?}",
+            ds.key_tag(),
+            ds.algorithm(),
+            ds.digest_type()
+        ),
         other => format!("{other:?}"),
     }
 }
@@ -560,35 +596,61 @@ async fn cmd_sec(tokens: &[&str], rules: &[(String, String)]) -> String {
         None => return "формат: /dns sec <name>".to_string(),
     };
     let timeout = parallel_timeout(rules);
-    let upstreams = enabled_upstreams(rules);
-    let pick = upstreams
+    let pick = enabled_upstreams(rules)
         .first()
         .copied()
         .unwrap_or(&UPSTREAMS[0]);
-    let validating = match build_resolver_for_ip(pick.ips[0], true) {
+    let upstream_ip = pick.ips[0];
+
+    // Three independent queries, all in parallel: the validating lookup
+    // (tells us "is this name's chain valid OR is the zone insecure"),
+    // and the DS/DNSKEY at the zone apex (tells us "is the zone signed
+    // at all"). The combination distinguishes secure / insecure / bogus.
+    let zone = zone_apex(name);
+    let validating = match build_resolver_for_ip(upstream_ip, true) {
         Ok(r) => Arc::new(r),
         Err(e) => return format!("не ква: {e}"),
     };
-
     let parsed = match Name::from_utf8(name) {
         Ok(n) => n,
         Err(e) => return format!("bad name: {e}"),
     };
     let start = Instant::now();
-    let res = tokio::time::timeout(timeout, validating.lookup(parsed, RecordType::A)).await;
+    let lookup_fut = tokio::time::timeout(timeout, validating.lookup(parsed, RecordType::A));
+    let ds_fut = query_at(upstream_ip, &zone, RecordType::DS, timeout);
+    let dnskey_fut = query_at(upstream_ip, &zone, RecordType::DNSKEY, timeout);
+    let (lookup_res, ds_q, dnskey_q) = futures::join!(lookup_fut, ds_fut, dnskey_fut);
     let rtt = start.elapsed();
 
+    let signed_at_parent = ds_q.error.is_none() && !ds_q.rows.is_empty();
+    let signed_at_zone = dnskey_q.error.is_none() && !dnskey_q.rows.is_empty();
+    let zone_signed = signed_at_parent && signed_at_zone;
+
     let mut out = format!("; {} — DNSSEC через {}\n", name, pick.label);
-    match res {
-        Err(_) => out.push_str(&format!("; таймаут {} ms\n", rtt.as_millis())),
+    match lookup_res {
+        Err(_) => out.push_str(&format!("⌛ таймаут {} ms\n", rtt.as_millis())),
+        Ok(Err(e)) if zone_signed => {
+            // The zone IS signed, and the validating resolver bailed.
+            // That's a real DNSSEC failure.
+            out.push_str(&format!("❌ цепочка сломана (bogus): {e}\n"));
+        }
         Ok(Err(e)) => {
-            // Validation failure shows up as a resolver error with a
-            // hint we surface plainly.
-            out.push_str(&format!("❌ валидация не прошла: {e}\n"));
+            // Zone isn't signed and the lookup failed for some other
+            // reason — propagate the error verbatim.
+            out.push_str(&format!("⚠️ {e}\n"));
         }
         Ok(Ok(lookup)) => {
-            out.push_str("✅ ответ валидирован\n");
+            if zone_signed {
+                out.push_str("✅ цепочка валидна (signed)\n");
+            } else {
+                out.push_str("ℹ️ зона не подписана DNSSEC (insecure)\n");
+            }
             for rec in lookup.answers() {
+                // RRSIG records would just repeat the signature blob we
+                // already validated; filter them out of the user view.
+                if rec.record_type() == RecordType::RRSIG {
+                    continue;
+                }
                 out.push_str(&format!(
                     "   {} {} {}\n",
                     rec.record_type(),
@@ -599,30 +661,41 @@ async fn cmd_sec(tokens: &[&str], rules: &[(String, String)]) -> String {
         }
     }
 
-    // Show the DS/DNSKEY presence at the zone — informative even when
-    // the answer above was OK, and explains a failure when it wasn't.
-    out.push_str("\n; цепочка:\n");
-    let zone = zone_apex(name);
-    for (label, rt) in &[("DS @parent", RecordType::DS), ("DNSKEY", RecordType::DNSKEY)] {
-        let q = query_at(pick.ips[0], &zone, *rt, timeout).await;
-        if q.error.is_some() {
-            out.push_str(&format!(
-                "   ❌ {} {}: {}\n",
-                zone,
-                label,
-                q.error.as_deref().unwrap_or("error")
-            ));
-        } else if q.rows.is_empty() {
-            out.push_str(&format!("   ⚠️ {} {}: (пусто)\n", zone, label));
+    out.push_str("\n; цепочка на апексе зоны:\n");
+    let ds_badge = if ds_q.error.is_some() {
+        "❌"
+    } else if ds_q.rows.is_empty() {
+        "·"
+    } else {
+        "✅"
+    };
+    out.push_str(&format!(
+        "   {ds_badge} {zone} DS    @parent: {}\n",
+        if let Some(err) = &ds_q.error {
+            err.clone()
+        } else if ds_q.rows.is_empty() {
+            "нет (зона не подписана)".to_string()
         } else {
-            out.push_str(&format!(
-                "   ✅ {} {}: {} записей\n",
-                zone,
-                label,
-                q.rows.len()
-            ));
+            format!("{} записей", ds_q.rows.len())
         }
-    }
+    ));
+    let dnskey_badge = if dnskey_q.error.is_some() {
+        "❌"
+    } else if dnskey_q.rows.is_empty() {
+        "·"
+    } else {
+        "✅"
+    };
+    out.push_str(&format!(
+        "   {dnskey_badge} {zone} DNSKEY:        {}\n",
+        if let Some(err) = &dnskey_q.error {
+            err.clone()
+        } else if dnskey_q.rows.is_empty() {
+            "нет".to_string()
+        } else {
+            format!("{} записей", dnskey_q.rows.len())
+        }
+    ));
     out
 }
 
