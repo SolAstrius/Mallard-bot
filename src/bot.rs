@@ -326,6 +326,7 @@ async fn handle_text(
     config: BotConfig,
 ) -> anyhow::Result<()> {
     track_membership(&msg, &config).await;
+    ambient_typst_fenced(&bot, &msg, &config).await;
     let text = match msg.text().or_else(|| msg.caption()) {
         Some(t) => t.to_string(),
         None => return Ok(()),
@@ -2282,6 +2283,55 @@ async fn cha_gossip(
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
+}
+
+// ---------- ambient.typst.fenced — auto-render ```typst blocks ----------
+
+/// Watches non-command messages for a fenced code block tagged `typst`.
+/// When the chat has `ambient.typst.fenced` enabled, the block is rendered
+/// silently — compile errors are logged, never echoed, since the user
+/// didn't explicitly ask. Plain ``` blocks (no language) are ignored on
+/// purpose — too noisy.
+async fn ambient_typst_fenced(bot: &Bot, msg: &Message, config: &BotConfig) {
+    if !is_feature_enabled(config, msg.chat.id, "ambient.typst.fenced").await {
+        return;
+    }
+    let Some(refs) = msg
+        .parse_entities()
+        .or_else(|| msg.parse_caption_entities())
+    else {
+        return;
+    };
+    use teloxide::types::MessageEntityKind;
+    let source = refs.iter().find_map(|e| match e.kind() {
+        MessageEntityKind::Pre {
+            language: Some(lang),
+        } if lang.eq_ignore_ascii_case("typst") => Some(e.text().to_string()),
+        _ => None,
+    });
+    let Some(source) = source else { return };
+
+    let mut opts = crate::typst::RenderOpts::default();
+    if let Ok(path) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
+        opts.package_cache_path = Some(std::path::PathBuf::from(path));
+    }
+    match crate::typst::render_png(&source, &opts).await {
+        Ok(bytes) => {
+            if let Err(e) = bot
+                .send_photo(
+                    msg.chat.id,
+                    InputFile::memory(bytes).file_name("typst.png"),
+                )
+                .reply_parameters(reply_params(msg))
+                .await
+            {
+                log::warn!("ambient typst send_photo: {e}");
+            }
+        }
+        Err(e) => {
+            log::info!("ambient typst skipped: {e}");
+        }
+    }
 }
 
 // ---------- /typst — render typst snippets to PNG ----------
