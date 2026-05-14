@@ -97,10 +97,18 @@ pub fn spawn_refresher(db: Db) {
     tokio::spawn(async move {
         loop {
             let staleness = last_refresh_age(&db).await;
+            // Treat the catalog as stale when:
+            //  - never refreshed
+            //  - older than STALE_THRESHOLD
+            //  - schema bumped (nix_pkg populated, nix_pkg_extra empty)
+            let schema_bumped = db.nix_extras_missing().await.unwrap_or(false);
             let need = match staleness {
                 None => true,
-                Some(age) => age >= STALE_THRESHOLD,
+                Some(age) => age >= STALE_THRESHOLD || schema_bumped,
             };
+            if schema_bumped {
+                log::info!("nix catalog: schema bump detected — forcing refresh");
+            }
             if need {
                 log::info!("nix catalog refresh starting (staleness: {:?})", staleness);
                 match refresh(&db).await {

@@ -212,6 +212,25 @@ impl Db {
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
 
+    /// True when `nix_pkg` has data but `nix_pkg_extra` doesn't. Indicates a
+    /// schema bump landed and the catalog needs a full refresh to repopulate
+    /// the extras side.
+    pub async fn nix_extras_missing(&self) -> rusqlite::Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let any_pkg: bool =
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM nix_pkg)", [], |r| r.get(0))?;
+            let any_extra: bool =
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM nix_pkg_extra)", [], |r| {
+                    r.get(0)
+                })?;
+            Ok::<_, rusqlite::Error>(any_pkg && !any_extra)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
     pub async fn nix_meta_set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
         let conn = self.conn.clone();
         let key = key.to_string();
