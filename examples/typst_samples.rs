@@ -1,7 +1,7 @@
 //! Render a few sample inputs to PNG for manual inspection.
 //! `nix-shell -p typst --run 'cargo run --example typst_samples'`
 
-use mallard_bot::typst::{render_png, RenderOpts};
+use mallard_bot::typst::{render, RenderOpts};
 
 #[tokio::main]
 async fn main() {
@@ -28,11 +28,18 @@ async fn main() {
 
     let opts = RenderOpts::default();
     for (name, src) in cases {
-        match render_png(src, &opts).await {
-            Ok(bytes) => {
-                let path = format!("{out_dir}/{name}.png");
-                std::fs::write(&path, &bytes).unwrap();
-                println!("{name}: {path} ({} bytes)", bytes.len());
+        match render(src, &opts).await {
+            Ok(pages) => {
+                for (i, bytes) in pages.iter().enumerate() {
+                    let suffix = if pages.len() == 1 {
+                        String::new()
+                    } else {
+                        format!("-{}", i + 1)
+                    };
+                    let path = format!("{out_dir}/{name}{suffix}.png");
+                    std::fs::write(&path, bytes).unwrap();
+                    println!("{name}{suffix}: {path} ({} bytes)", bytes.len());
+                }
             }
             Err(e) => println!("{name}: ERR {e}"),
         }

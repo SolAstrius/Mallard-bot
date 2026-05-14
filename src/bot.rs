@@ -6,9 +6,9 @@ use rand::Rng;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatKind, FileId, InlineQueryResult, InlineQueryResultArticle, InputFile, InputMessageContent,
-    InputMessageContentText, MediaKind, MessageKind, MessageOrigin, ParseMode, ReplyParameters,
-    StickerFormat, UserId,
+    ChatKind, FileId, InlineQueryResult, InlineQueryResultArticle, InputFile, InputMedia,
+    InputMediaPhoto, InputMessageContent, InputMessageContentText, MediaKind, MessageKind,
+    MessageOrigin, ParseMode, ReplyParameters, StickerFormat, UserId,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
@@ -2311,21 +2311,11 @@ async fn ambient_typst_fenced(bot: &Bot, msg: &Message, config: &BotConfig) {
     });
     let Some(source) = source else { return };
 
-    let mut opts = crate::typst::RenderOpts::default();
-    if let Ok(path) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
-        opts.package_cache_path = Some(std::path::PathBuf::from(path));
-    }
-    match crate::typst::render_png(&source, &opts).await {
-        Ok(bytes) => {
-            if let Err(e) = bot
-                .send_photo(
-                    msg.chat.id,
-                    InputFile::memory(bytes).file_name("typst.png"),
-                )
-                .reply_parameters(reply_params(msg))
-                .await
-            {
-                log::warn!("ambient typst send_photo: {e}");
+    let opts = typst_opts_from_env();
+    match crate::typst::render(&source, &opts).await {
+        Ok(pages) => {
+            if let Err(e) = send_typst_pages(bot, msg, pages).await {
+                log::warn!("ambient typst send: {e}");
             }
         }
         Err(e) => {
@@ -2408,16 +2398,10 @@ async fn handle_typst(
         return Ok(());
     };
 
-    let mut opts = crate::typst::RenderOpts::default();
-    if let Ok(path) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
-        opts.package_cache_path = Some(std::path::PathBuf::from(path));
-    }
-
-    match crate::typst::render_png(&source, &opts).await {
-        Ok(bytes) => {
-            bot.send_photo(msg.chat.id, InputFile::memory(bytes).file_name("typst.png"))
-                .reply_parameters(reply_params(msg))
-                .await?;
+    let opts = typst_opts_from_env();
+    match crate::typst::render(&source, &opts).await {
+        Ok(pages) => {
+            send_typst_pages(bot, msg, pages).await?;
         }
         Err(e) => {
             let text = e.to_string();
@@ -2434,4 +2418,50 @@ async fn handle_typst(
         }
     }
     Ok(())
+}
+
+/// Build `RenderOpts` with the package cache path pulled from env, falling
+/// back to typst's own default when the variable isn't set (local dev).
+fn typst_opts_from_env() -> crate::typst::RenderOpts {
+    let mut opts = crate::typst::RenderOpts::default();
+    if let Ok(path) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
+        opts.package_cache_path = Some(std::path::PathBuf::from(path));
+    }
+    opts
+}
+
+/// Single page → `send_photo`. Two-to-ten pages → `send_media_group`
+/// (Telegram's album cap). Both reply to the originating message.
+async fn send_typst_pages(
+    bot: &Bot,
+    msg: &Message,
+    pages: Vec<Vec<u8>>,
+) -> anyhow::Result<()> {
+    match pages.len() {
+        0 => Ok(()), // render returns NoOutput before this, but guard anyway
+        1 => {
+            bot.send_photo(
+                msg.chat.id,
+                InputFile::memory(pages.into_iter().next().unwrap()).file_name("typst.png"),
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+            Ok(())
+        }
+        _ => {
+            let media: Vec<InputMedia> = pages
+                .into_iter()
+                .enumerate()
+                .map(|(i, bytes)| {
+                    InputMedia::Photo(InputMediaPhoto::new(
+                        InputFile::memory(bytes).file_name(format!("typst-{}.png", i + 1)),
+                    ))
+                })
+                .collect();
+            bot.send_media_group(msg.chat.id, media)
+                .reply_parameters(reply_params(msg))
+                .await?;
+            Ok(())
+        }
+    }
 }
