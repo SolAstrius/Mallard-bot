@@ -31,6 +31,7 @@ pub struct BotConfig {
     pub pack: Option<StickerPack>,
     pub db: crate::db::Db,
     pub tea_sessions: crate::sessions::SessionStore,
+    pub bot_username: String,
 }
 
 #[derive(BotCommands, Clone)]
@@ -82,6 +83,8 @@ pub enum Command {
     Tex(String),
     #[command(description = "/math <код> — кряква сама поймёт, typst это или latex")]
     Math(String),
+    #[command(description = "включить/выключить расширенный inline-режим (только в личке)")]
+    Inline,
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -203,6 +206,16 @@ const HELP_MATH: &str = "/math <код> — кряква сама смотрит
 Если автоопределение промахнулось, используйте явные /typst или /latex.\n\
 кря-кря.";
 
+const HELP_INLINE: &str = "/inline — переключить расширенный inline-режим (только в личке у кряквы).\n\
+По умолчанию инлайн (@<бот> ...) возвращает только зверушку дня — это легаси и оно не меняется.\n\
+После включения в инлайне доступны:\n\
+* @<бот> roll 2d6 — кубики\n\
+* @<бот> pick чай, кофе, борщ — выбор из списка\n\
+* @<бот> horoscope — гороскоп\n\
+* @<бот> creature — зверушка дня\n\
+/inline ещё раз — выключить обратно.\n\
+кря-кря.";
+
 const HELP_FEATURE: &str = "/feature — управление флагами команд в этом чате.\n\
 Имена флагов — это пути с точками (`fun.roll`, `nix.npkg`).\n\
 Просмотр:\n\
@@ -253,6 +266,7 @@ fn help_for(query: &str) -> String {
         "typst" => HELP_TYPST.to_string(),
         "latex" | "tex" => HELP_LATEX.to_string(),
         "math" => HELP_MATH.to_string(),
+        "inline" => HELP_INLINE.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -435,6 +449,7 @@ async fn handle_command(
         Command::Latex(r) => format!("latex {r}").trim().to_string(),
         Command::Tex(r) => format!("tex {r}").trim().to_string(),
         Command::Math(r) => format!("math {r}").trim().to_string(),
+        Command::Inline => "inline".to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -472,6 +487,7 @@ async fn handle_command(
             handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Latex).await
         }
         Command::Math(rest) => handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Auto).await,
+        Command::Inline => handle_inline_toggle(&bot, &msg, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -1016,23 +1032,211 @@ async fn import_one(
     Ok(())
 }
 
-async fn handle_inline(bot: Bot, q: InlineQuery, mallard: SharedMallard) -> anyhow::Result<()> {
-    let creature = { mallard.lock().await.get_creature().to_string() };
+async fn handle_inline(
+    bot: Bot,
+    q: InlineQuery,
+    mallard: SharedMallard,
+    config: BotConfig,
+) -> anyhow::Result<()> {
+    let user_id = q.from.id;
+    let query = q.query.trim();
     log::info!(
-        "inline from @{}: {:?} → {creature}",
+        "inline from @{}: {:?}",
         q.from.username.as_deref().unwrap_or("?"),
         q.query
     );
-    let result = InlineQueryResultArticle::new(
+
+    // Empty query → legacy creature, no opt-in check (no command to dispatch
+    // anyway, and the result describes itself).
+    if query.is_empty() {
+        let creature = { mallard.lock().await.get_creature().to_string() };
+        let results = vec![inline_creature_result(&creature, None)];
+        bot.answer_inline_query(q.id, results)
+            .cache_time(60 * 60 * 3)
+            .is_personal(true)
+            .await?;
+        return Ok(());
+    }
+
+    // Non-empty query: gated. Admin auto-opted-in.
+    let opted_in = config.admin_id == Some(user_id)
+        || config
+            .db
+            .inline_opt_in_get(user_id.0 as i64)
+            .await
+            .unwrap_or(false);
+
+    if !opted_in {
+        let creature = { mallard.lock().await.get_creature().to_string() };
+        let hint = "напишите /inline крякве в личке, чтобы включить roll / pick / horoscope в инлайне.";
+        let results = vec![inline_creature_result(&creature, Some(hint))];
+        bot.answer_inline_query(q.id, results)
+            .cache_time(0)
+            .is_personal(true)
+            .await?;
+        return Ok(());
+    }
+
+    // Opted-in dispatch on the first word.
+    let mut parts = query.splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("").to_lowercase();
+    let rest = parts.next().unwrap_or("").trim();
+
+    let results: Vec<InlineQueryResult> = match verb.as_str() {
+        "roll" | "r" | "/roll" => inline_roll(rest),
+        "pick" | "p" | "/pick" => inline_pick(rest),
+        "horoscope" | "h" | "/horoscope" => inline_horoscope(),
+        "creature" | "ква" | "/creature" => {
+            let creature = { mallard.lock().await.get_creature().to_string() };
+            vec![inline_creature_result(&creature, None)]
+        }
+        _ => {
+            let creature = { mallard.lock().await.get_creature().to_string() };
+            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, creature.";
+            vec![inline_creature_result(&creature, Some(hint))]
+        }
+    };
+
+    bot.answer_inline_query(q.id, results)
+        .cache_time(0)
+        .is_personal(true)
+        .await?;
+    Ok(())
+}
+
+fn inline_creature_result(creature: &str, description: Option<&str>) -> InlineQueryResult {
+    let mut article = InlineQueryResultArticle::new(
         uuid::Uuid::new_v4().to_string(),
         "Кто ты сегодня?",
         InputMessageContent::Text(
             InputMessageContentText::new(format!("<i>{creature}</i>")).parse_mode(ParseMode::Html),
         ),
     );
-    bot.answer_inline_query(q.id, [InlineQueryResult::Article(result)])
-        .cache_time(60 * 60 * 3)
-        .is_personal(true)
+    if let Some(d) = description {
+        article = article.description(d.to_string());
+    }
+    InlineQueryResult::Article(article)
+}
+
+fn inline_roll(rest: &str) -> Vec<InlineQueryResult> {
+    let expr = if rest.is_empty() { "1d6" } else { rest };
+    let (body, as_html) = match caith::Roller::new(expr) {
+        Ok(roller) => match roller.roll() {
+            Ok(result) => (
+                format!("\u{1F3B2} {}", caith_md_to_html(&result.to_string())),
+                true,
+            ),
+            Err(e) => (format!("не ква, не получилось бросить: {e}"), false),
+        },
+        Err(e) => (format!("не ква, не понял выражение: {e}"), false),
+    };
+    // Strip HTML tags for the article title (Telegram doesn't render
+    // formatting in titles, just truncates).
+    let title = strip_tags(&body);
+    let content = if as_html {
+        InputMessageContent::Text(InputMessageContentText::new(body).parse_mode(ParseMode::Html))
+    } else {
+        InputMessageContent::Text(InputMessageContentText::new(body))
+    };
+    vec![InlineQueryResult::Article(
+        InlineQueryResultArticle::new(uuid::Uuid::new_v4().to_string(), title, content)
+            .description(format!("/roll {expr}")),
+    )]
+}
+
+fn inline_pick(rest: &str) -> Vec<InlineQueryResult> {
+    use rand::seq::SliceRandom;
+    let options: Vec<&str> = rest
+        .split([',', '|', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if options.len() < 2 {
+        let body = "перечисли через запятую хотя бы два варианта: pick чай, кофе, борщ";
+        return vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+            uuid::Uuid::new_v4().to_string(),
+            "не хватает вариантов",
+            InputMessageContent::Text(InputMessageContentText::new(body.to_string())),
+        ))];
+    }
+    let chosen: String = {
+        let mut rng = rand::thread_rng();
+        options.choose(&mut rng).copied().unwrap_or("").to_string()
+    };
+    let body = format!("\u{1F50D} {chosen}");
+    vec![InlineQueryResult::Article(
+        InlineQueryResultArticle::new(
+            uuid::Uuid::new_v4().to_string(),
+            body.clone(),
+            InputMessageContent::Text(InputMessageContentText::new(body)),
+        )
+        .description(format!("из {} вариантов", options.len())),
+    )]
+}
+
+fn inline_horoscope() -> Vec<InlineQueryResult> {
+    use crate::dictionaries::CREATURES;
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+    let creature = CREATURES.choose(&mut rng).copied().unwrap_or("Я уточка!");
+    let line = HOROSCOPE_LINES
+        .choose(&mut rng)
+        .copied()
+        .unwrap_or("сегодня день будет.");
+    let body = format!("\u{1F52E} <i>{creature}</i>\n{line}");
+    let title = format!("\u{1F52E} {line}");
+    vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+        uuid::Uuid::new_v4().to_string(),
+        title,
+        InputMessageContent::Text(InputMessageContentText::new(body).parse_mode(ParseMode::Html)),
+    ))]
+}
+
+/// Strip well-formed HTML tags (`<…>`) — used for inline article titles
+/// since Telegram renders titles as plain text.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+async fn handle_inline_toggle(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !matches!(msg.chat.kind, ChatKind::Private(_)) {
+        bot.send_message(msg.chat.id, "только в личке: напишите /inline крякве в DM.")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let new_state = config.db.inline_opt_in_toggle(from.id.0 as i64).await?;
+    let body = if new_state {
+        format!(
+            "inline-режим включён. в любом чате наберите:\n\
+             @{u} roll 2d6\n\
+             @{u} pick чай, кофе, борщ\n\
+             @{u} horoscope\n\
+             /inline ещё раз — выключить.",
+            u = config.bot_username
+        )
+    } else {
+        "inline-режим выключен. /inline ещё раз — обратно включить.".to_string()
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
 }

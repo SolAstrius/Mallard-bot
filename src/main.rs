@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         pack,
         db,
         tea_sessions,
+        bot_username: bot_username.clone(),
     };
 
     build_dispatcher(bot, mallard, config).dispatch().await;

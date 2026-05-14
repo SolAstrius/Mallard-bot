@@ -67,6 +67,15 @@ CREATE TABLE IF NOT EXISTS nix_meta (
     value TEXT NOT NULL
 );
 
+-- Per-user opt-in for the rich inline-query handler. Missing row → user
+-- gets the legacy creature response on inline queries; presence → query
+-- string is parsed and dispatched. Per-user (not per-chat) because inline
+-- mode follows the user across chats.
+CREATE TABLE IF NOT EXISTS inline_opt_in (
+    user_id INTEGER PRIMARY KEY,
+    since   INTEGER NOT NULL
+);
+
 -- Per-chat per-feature toggle. Missing row → use the in-code default for that
 -- feature name. Lets a chat opt out of `cha`/`roll` or opt into `npkg`/`nopt`.
 CREATE TABLE IF NOT EXISTS chat_features (
@@ -422,6 +431,50 @@ impl Db {
                 .query_map(rusqlite::params![b, limit], pkg_row_with_extra)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    // ---------- per-user inline opt-in ----------
+
+    pub async fn inline_opt_in_get(&self, user_id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare("SELECT 1 FROM inline_opt_in WHERE user_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![user_id])?;
+            Ok::<_, rusqlite::Error>(rows.next()?.is_some())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Flip the user's opt-in state. Returns the new state.
+    pub async fn inline_opt_in_toggle(&self, user_id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare("SELECT 1 FROM inline_opt_in WHERE user_id = ?1")?;
+            let already = stmt.query(rusqlite::params![user_id])?.next()?.is_some();
+            drop(stmt);
+            if already {
+                conn.execute(
+                    "DELETE FROM inline_opt_in WHERE user_id = ?1",
+                    rusqlite::params![user_id],
+                )?;
+                Ok::<_, rusqlite::Error>(false)
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                conn.execute(
+                    "INSERT INTO inline_opt_in(user_id, since) VALUES(?1, ?2)",
+                    rusqlite::params![user_id, now],
+                )?;
+                Ok(true)
+            }
         })
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
