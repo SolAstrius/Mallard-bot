@@ -8,8 +8,10 @@ use mallard_bot::typst::{RenderOpts, Theme};
 #[tokio::main]
 async fn main() {
     std::fs::create_dir_all("/tmp/dark-samples").unwrap();
-    let mut opts = RenderOpts::default();
-    opts.theme = Theme::Dark;
+    let opts = RenderOpts {
+        theme: Theme::Dark,
+        ..RenderOpts::default()
+    };
 
     let math_cases: &[(&str, Dialect)] = &[
         ("x^2 + 1", Dialect::Typst),

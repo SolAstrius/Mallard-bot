@@ -55,6 +55,30 @@ impl Theme {
     }
 }
 
+/// Scan the first few lines of a doc for a `// @theme: dark|light`
+/// directive that overrides the chat-level theme flag. Both `// @theme: dark`
+/// and `// @theme dark` are accepted. The comment is a valid Typst comment
+/// either way so it's invisible to the compiler.
+pub fn detect_theme_directive(src: &str) -> Option<Theme> {
+    for line in src.lines().take(8) {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("//") else {
+            continue;
+        };
+        let rest = rest.trim();
+        let Some(v) = rest.strip_prefix("@theme") else {
+            continue;
+        };
+        let v = v.trim_start_matches(':').trim().to_lowercase();
+        return match v.as_str() {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            _ => None,
+        };
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderOpts {
     pub ppi: u32,

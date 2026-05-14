@@ -227,12 +227,17 @@ const HELP_CALC: &str = "/calc <выражение> — посчитать. По
 Для символьных штук (производные, упрощение) будет отдельный /sym.\n\
 кря-кря.";
 
-const HELP_THEME: &str = "Тёмная тема для всех картинок (typst, latex, /sym, /plot).\n\
-По умолчанию белый фон, чёрный текст. Включить тёмную:\n\
-/feature util.theme.dark on\n\
-Выключить обратно:\n\
-/feature util.theme.dark off\n\
-Кэш картинок отдельный для каждой темы, так что переключение не путает закэшированные старые рендеры.\n\
+const HELP_THEME: &str = "Тёмная тема для всех картинок (typst, latex, /math, /plot, ambient).\n\
+По умолчанию белый фон, чёрный текст. Переключение в чате:\n\
+/feature util.theme.dark on   — включить\n\
+/feature util.theme.dark off  — выключить\n\
+\n\
+Документ может насильно задать тему сам — добавьте в первые строки typst-кода комментарий-директиву:\n\
+  // @theme: dark\n\
+  // @theme: light\n\
+Поддерживают /typst, /latex, /math, /plot и ambient-детекторы (доступно через ```typst-блоки и $$…$$). Директива побеждает чат-флаг.\n\
+\n\
+Кэш картинок отдельный для каждой темы, переключение не путает закэшированные старые рендеры.\n\
 кря-кря.";
 
 const HELP_PLOT: &str = "/plot <выражение>, <от>, <до> — нарисовать график. Через typst + cetz-plot.\n\
@@ -2949,7 +2954,7 @@ async fn handle_math_cmd(
         MathRoute::Auto => crate::math::detect(&source),
     };
 
-    let opts = typst_opts_for(config, msg.chat.id).await;
+    let opts = typst_opts_for_source(config, msg.chat.id, &source).await;
     match crate::math::render(&source, dialect, &opts).await {
         Ok(pages) => {
             send_typst_pages(bot, msg, pages).await?;
@@ -3002,7 +3007,7 @@ async fn ambient_fenced(
     });
     let Some(source) = source else { return };
 
-    let opts = typst_opts_for(config, msg.chat.id).await;
+    let opts = typst_opts_for_source(config, msg.chat.id, &source).await;
     match crate::math::render(&source, dialect, &opts).await {
         Ok(pages) => {
             if let Err(e) = send_typst_pages(bot, msg, pages).await {
@@ -3034,7 +3039,7 @@ async fn ambient_math_dollar(bot: &Bot, msg: &Message, config: &BotConfig) {
     }
 
     let dialect = crate::math::detect(source);
-    let opts = typst_opts_for(config, msg.chat.id).await;
+    let opts = typst_opts_for_source(config, msg.chat.id, source).await;
     match crate::math::render(source, dialect, &opts).await {
         Ok(pages) => {
             if let Err(e) = send_typst_pages(bot, msg, pages).await {
@@ -3061,6 +3066,20 @@ async fn typst_opts_for(config: &BotConfig, chat: ChatId) -> crate::typst::Rende
     let mut opts = typst_opts_from_env();
     if is_feature_enabled(config, chat, "util.theme.dark").await {
         opts.theme = crate::typst::Theme::Dark;
+    }
+    opts
+}
+
+/// Like [`typst_opts_for`], but also lets the source override the chat's
+/// theme via a `// @theme: dark|light` directive at the top of the doc.
+async fn typst_opts_for_source(
+    config: &BotConfig,
+    chat: ChatId,
+    source: &str,
+) -> crate::typst::RenderOpts {
+    let mut opts = typst_opts_for(config, chat).await;
+    if let Some(t) = crate::typst::detect_theme_directive(source) {
+        opts.theme = t;
     }
     opts
 }
@@ -3302,7 +3321,7 @@ async fn handle_plot(
         return Ok(());
     }
 
-    let render_opts = typst_opts_for(config, msg.chat.id).await;
+    let render_opts = typst_opts_for_source(config, msg.chat.id, args).await;
     match crate::plot::render_args(args, &render_opts).await {
         Ok(pages) => {
             send_typst_pages(bot, msg, pages).await?;
