@@ -2651,8 +2651,12 @@ async fn handle_feature(
         .await
         .unwrap_or_default();
 
+    // For exact-path writes the user wants to see "after" for that one leaf.
+    // For wildcard/recursive writes a per-leaf dump would be a wall of text;
+    // the verb header already names the pattern and we tell them where to
+    // look if they want details.
     let mut exact_after: Vec<String> = Vec::new();
-    let mut wildcard_summaries: Vec<String> = Vec::new();
+    let mut wildcard_hints: Vec<String> = Vec::new();
     for p in &patterns {
         let leaves = features::leaves_matching(p);
         if leaves.is_empty() {
@@ -2666,11 +2670,11 @@ async fn handle_feature(
                 }
             }
             FeaturePattern::Wildcard(_) | FeaturePattern::Recursive(_) => {
-                wildcard_summaries.push(format!(
-                    "  {} — затронуто {} флагов (см. /feature {})",
+                wildcard_hints.push(format!(
+                    "  {} — затронуто {} флагов; /feature {} чтобы посмотреть",
                     p.display(),
                     leaves.len(),
-                    p.display().trim_end_matches(".**").trim_end_matches(".*"),
+                    anchor_path(p),
                 ));
             }
         }
@@ -2686,9 +2690,8 @@ async fn handle_feature(
         lines.push("сейчас:".to_string());
         lines.extend(exact_after);
     }
-    if !wildcard_summaries.is_empty() {
-        lines.push("сводка:".to_string());
-        lines.extend(wildcard_summaries);
+    if !wildcard_hints.is_empty() {
+        lines.extend(wildcard_hints);
     }
     if !bad.is_empty() {
         lines.push(format!("пропущено: {}", bad.join("; ")));
@@ -2709,8 +2712,143 @@ async fn handle_feature(
     Ok(())
 }
 
-/// Full per-chat state: declared rules + effective value for every
-/// registered leaf, grouped by top-level category.
+/// Prefix without the trailing `.*` / `.**` from a pattern — i.e. the
+/// subtree the user is asking about. Bare `*` collapses to "" (the whole
+/// registry).
+fn anchor_path(p: &FeaturePattern) -> &str {
+    match p {
+        FeaturePattern::Exact(s) => s.as_str(),
+        FeaturePattern::Wildcard(s) => {
+            if s == "*" {
+                ""
+            } else {
+                s.strip_suffix(".*").unwrap_or(s.as_str())
+            }
+        }
+        FeaturePattern::Recursive(s) => s.as_str(),
+    }
+}
+
+/// Threshold: at most this many leaves get expanded inline. Past that, the
+/// subtree is collapsed by next-segment with a one-line summary per branch.
+const SUBTREE_INLINE_THRESHOLD: usize = 12;
+
+/// Render the leaves under `anchor` with smart collapse. Empty anchor =
+/// the whole registry.
+fn render_anchor(rules: &[(String, String)], anchor: &str) -> Vec<String> {
+    let leaves: Vec<&'static features::FeatureDef> = if anchor.is_empty() {
+        features::FEATURES.iter().collect()
+    } else {
+        let dotted = format!("{anchor}.");
+        features::FEATURES
+            .iter()
+            .filter(|f| f.path == anchor || f.path.starts_with(&dotted))
+            .collect()
+    };
+    if leaves.is_empty() {
+        return vec!["  (пусто)".to_string()];
+    }
+    if leaves.len() <= SUBTREE_INLINE_THRESHOLD {
+        let mut out: Vec<String> = Vec::new();
+        for leaf in leaves {
+            let (v, by) = features::resolve(rules, leaf.path);
+            let src = by
+                .map(|r| format!(" ← {r}"))
+                .unwrap_or_default();
+            out.push(format!("  {}{src}", features::format_leaf(leaf, &v)));
+        }
+        return out;
+    }
+
+    // Too many — collapse by the segment immediately after the anchor.
+    let anchor_depth = if anchor.is_empty() {
+        0
+    } else {
+        anchor.split('.').count()
+    };
+    let mut groups: std::collections::BTreeMap<&'static str, Vec<&'static features::FeatureDef>> =
+        std::collections::BTreeMap::new();
+    let mut direct_leaf_at_anchor: Option<&'static features::FeatureDef> = None;
+    for leaf in &leaves {
+        let segs: Vec<&str> = leaf.path.split('.').collect();
+        if segs.len() == anchor_depth {
+            direct_leaf_at_anchor = Some(*leaf);
+            continue;
+        }
+        let key = segs[anchor_depth];
+        groups.entry(key).or_default().push(*leaf);
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    if let Some(leaf) = direct_leaf_at_anchor {
+        let (v, by) = features::resolve(rules, leaf.path);
+        let src = by.map(|r| format!(" ← {r}")).unwrap_or_default();
+        out.push(format!("  {}{src}", features::format_leaf(leaf, &v)));
+    }
+    for (seg, members) in groups {
+        let prefix = if anchor.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{anchor}.{seg}")
+        };
+        // A "branch" with only one leaf in it isn't really a branch — render
+        // the leaf directly so the user sees "✅ ambient.typst.fenced"
+        // instead of "[ambient.typst] ✅ все 1".
+        if members.len() == 1 {
+            let leaf = members[0];
+            let (v, by) = features::resolve(rules, leaf.path);
+            let src = by.map(|r| format!(" ← {r}")).unwrap_or_default();
+            out.push(format!("  {}{src}", features::format_leaf(leaf, &v)));
+        } else {
+            out.push(render_branch_summary(&prefix, &members, rules));
+        }
+    }
+    out
+}
+
+/// One-line summary for a collapsed branch: counts of bool leaves on/off,
+/// plus inline values for any non-bool leaves directly under that branch
+/// (like a per-group `mode` enum). Drilldown hint trails so the user knows
+/// how to expand it.
+fn render_branch_summary(
+    prefix: &str,
+    members: &[&features::FeatureDef],
+    rules: &[(String, String)],
+) -> String {
+    let mut bool_on = 0usize;
+    let mut bool_total = 0usize;
+    let mut inlines: Vec<String> = Vec::new();
+    for f in members {
+        let (v, _) = features::resolve(rules, f.path);
+        match f.ty {
+            features::TypeSpec::Bool => {
+                bool_total += 1;
+                if features::parse_bool(&v) == Some(true) {
+                    bool_on += 1;
+                }
+            }
+            _ => {
+                let short = f.path.rsplit('.').next().unwrap_or(f.path);
+                inlines.push(format!("{short}={v}"));
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if bool_total > 0 {
+        if bool_on == bool_total {
+            parts.push(format!("\u{2705} все {bool_total}"));
+        } else if bool_on == 0 {
+            parts.push(format!("\u{274C} все {bool_total}"));
+        } else {
+            parts.push(format!("{bool_on}/{bool_total} \u{2705}"));
+        }
+    }
+    parts.extend(inlines);
+    format!("  [{prefix}] {}", parts.join(", "))
+}
+
+/// Full per-chat state: declared rules + a collapsed view of every
+/// registered leaf grouped under the top-level segments.
 fn render_feature_overview(chat_id: i64, rules: &[(String, String)]) -> String {
     let mut lines: Vec<String> = vec![format!("\u{2699}\u{FE0F} флаги в чате {chat_id}:")];
 
@@ -2725,52 +2863,26 @@ fn render_feature_overview(chat_id: i64, rules: &[(String, String)]) -> String {
 
     lines.push(String::new());
     lines.push("состояние:".to_string());
-    for cat in features::categories() {
-        let cat_prefix = format!("{cat}.");
-        let mut header_pushed = false;
-        for f in features::FEATURES
-            .iter()
-            .filter(|f| f.path.starts_with(&cat_prefix) || f.path == cat)
-        {
-            if !header_pushed {
-                lines.push(format!("  [{cat}]"));
-                header_pushed = true;
-            }
-            let (v, by) = features::resolve(rules, f.path);
-            let src = by
-                .map(|r| format!("← {r}"))
-                .unwrap_or_else(|| "← по умолчанию".to_string());
-            lines.push(format!("    {} {src}", features::format_leaf(f, &v)));
-        }
-    }
+    lines.extend(render_anchor(rules, ""));
 
     lines.push(String::new());
+    lines.push("уточнить: /feature <ветка> — раскрыть поддерево".to_string());
     lines.push(
-        "управление (для админов): /feature <шаблон>[, <шаблон>] on|off|<значение>|reset"
+        "управление (для админов): /feature <шаблон> on|off|<значение>|reset"
             .to_string(),
-    );
-    lines.push(
-        "примеры: /feature nix.* on; /feature ambient.keywords.memes.mode endswith; /feature util.** reset".to_string(),
     );
     lines.join("\n")
 }
 
-/// Effective state for the leaves under one pattern. Used by the
-/// `/feature <prefix>` query form.
+/// Effective state under one user-specified pattern.
 fn render_feature_subtree(rules: &[(String, String)], pat: &FeaturePattern) -> String {
-    let mut lines = vec![format!("[{}]", pat.display())];
-    let leaves = features::leaves_matching(pat);
-    if leaves.is_empty() {
-        lines.push("  (пусто)".to_string());
-        return lines.join("\n");
-    }
-    for leaf in leaves {
-        let (v, by) = features::resolve(rules, leaf.path);
-        let src = by
-            .map(|r| format!("← {r}"))
-            .unwrap_or_else(|| "← по умолчанию".to_string());
-        lines.push(format!("  {} {src}", features::format_leaf(leaf, &v)));
-    }
+    let anchor = anchor_path(pat);
+    let header = format!(
+        "[{}]",
+        if anchor.is_empty() { "все" } else { anchor }
+    );
+    let mut lines = vec![header];
+    lines.extend(render_anchor(rules, anchor));
     lines.join("\n")
 }
 
