@@ -86,6 +86,8 @@ pub enum Command {
     Math(String),
     #[command(description = "включить/выключить расширенный inline-режим (только в личке)")]
     Inline,
+    #[command(description = "посчитать: /calc 1/3 + 1/3 + 1/3, /calc 60 mph in m/s, /calc 2^256")]
+    Calc(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -207,6 +209,20 @@ const HELP_MATH: &str = "/math <код> — кряква сама смотрит
 Если автоопределение промахнулось, используйте явные /typst или /latex.\n\
 кря-кря.";
 
+const HELP_CALC: &str = "/calc <выражение> — посчитать. Под капотом fend-core, точная арифметика и куча единиц.\n\
+Что умеет:\n\
+* арифметика без округлений: /calc 1/3 + 1/3 + 1/3 → 1\n\
+* большие числа: /calc 100! или /calc 2^256\n\
+* единицы и конверсии: /calc 60 mph in m/s, /calc 5 km + 3 mi in km, /calc 1 atm * 1 L in J\n\
+* температуры: /calc 451 fahrenheit in celsius\n\
+* основания: /calc 0xff & 0b1010, /calc 255 to hex\n\
+* комплексные: /calc (3 + 4i) * (1 - 2i)\n\
+* тригонометрия с явными углами: /calc sin(pi/4), /calc tan(45 deg)\n\
+* даты: /calc today + 30 days, /calc 2026-12-31 - today\n\
+* короткие функции прямо в выражении: /calc f: x -> x^2; f(7)\n\
+Для символьных штук (производные, упрощение) будет отдельный /sym.\n\
+кря-кря.";
+
 const HELP_INLINE: &str = "/inline — переключить расширенный inline-режим (только в личке у кряквы).\n\
 По умолчанию инлайн (@<бот> ...) возвращает только зверушку дня — это легаси и оно не меняется.\n\
 После включения в инлайне доступны:\n\
@@ -217,6 +233,8 @@ const HELP_INLINE: &str = "/inline — переключить расширенн
 * @<бот> latex \\frac{1}{2} — то же через mitex\n\
 * @<бот> math <код> — кряква сама поймёт диалект\n\
 * @<бот> $$ <код> $$ — то же самое, короче\n\
+* @<бот> calc 60 mph in m/s — посчитать\n\
+* @<бот> $2^256$ — то же самое для calc, короче\n\
 * @<бот> creature — зверушка дня\n\
 /inline ещё раз — выключить обратно.\n\
 кря-кря.";
@@ -272,6 +290,7 @@ fn help_for(query: &str) -> String {
         "latex" | "tex" => HELP_LATEX.to_string(),
         "math" => HELP_MATH.to_string(),
         "inline" => HELP_INLINE.to_string(),
+        "calc" => HELP_CALC.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -455,6 +474,7 @@ async fn handle_command(
         Command::Tex(r) => format!("tex {r}").trim().to_string(),
         Command::Math(r) => format!("math {r}").trim().to_string(),
         Command::Inline => "inline".to_string(),
+        Command::Calc(r) => format!("calc {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -493,6 +513,7 @@ async fn handle_command(
         }
         Command::Math(rest) => handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Auto).await,
         Command::Inline => handle_inline_toggle(&bot, &msg, &config).await,
+        Command::Calc(rest) => handle_calc(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -1073,7 +1094,7 @@ async fn handle_inline(
 
     if !opted_in {
         let creature = { mallard.lock().await.get_creature().to_string() };
-        let hint = "напишите /inline крякве в личке, чтобы включить roll / pick / horoscope в инлайне.";
+        let hint = "напишите /inline крякве в личке, чтобы включить roll / pick / horoscope / calc / typst в инлайне.";
         let results = vec![inline_creature_result(&creature, Some(hint))];
         bot.answer_inline_query(q.id, results)
             .cache_time(0)
@@ -1098,6 +1119,22 @@ async fn handle_inline(
         }
     }
 
+    // `$ ... $` shortcut: whole query wrapped in single dollars → calc.
+    // Compute, not render. Checked after `$$ ... $$` so the longer form
+    // wins. Whitespace tolerance: any single-$ on each side.
+    if query.starts_with('$') && query.ends_with('$') && query.len() >= 3 {
+        let inner = &query[1..query.len() - 1];
+        let expr = inner.trim();
+        if !expr.is_empty() {
+            let results = inline_calc(expr).await;
+            bot.answer_inline_query(q.id, results)
+                .cache_time(0)
+                .is_personal(true)
+                .await?;
+            return Ok(());
+        }
+    }
+
     // Opted-in dispatch on the first word.
     let mut parts = query.splitn(2, char::is_whitespace);
     let verb = parts.next().unwrap_or("").to_lowercase();
@@ -1112,13 +1149,14 @@ async fn handle_inline(
             inline_render(&bot, &config, rest, MathRoute::Latex).await
         }
         "math" | "/math" => inline_render(&bot, &config, rest, MathRoute::Auto).await,
+        "calc" | "c" | "/calc" => inline_calc(rest).await,
         "creature" | "ква" | "/creature" => {
             let creature = { mallard.lock().await.get_creature().to_string() };
             vec![inline_creature_result(&creature, None)]
         }
         _ => {
             let creature = { mallard.lock().await.get_creature().to_string() };
-            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, typst, latex, math, creature.";
+            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, typst, latex, math, calc, creature.";
             vec![inline_creature_result(&creature, Some(hint))]
         }
     };
@@ -1283,6 +1321,58 @@ fn short_preview(s: &str) -> String {
         t
     } else {
         stripped
+    }
+}
+
+async fn inline_calc(rest: &str) -> Vec<InlineQueryResult> {
+    let expr = rest.trim();
+    if expr.is_empty() {
+        let body = "пример: calc 60 mph in m/s";
+        return vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+            uuid::Uuid::new_v4().to_string(),
+            body,
+            InputMessageContent::Text(InputMessageContentText::new(body.to_string())),
+        ))];
+    }
+    let opts = crate::calc::CalcOpts::default();
+    match crate::calc::evaluate(expr, &opts).await {
+        Ok(result) => {
+            let trimmed = if result.chars().count() > 3500 {
+                let mut t: String = result.chars().take(3500).collect();
+                t.push('…');
+                t
+            } else {
+                result.clone()
+            };
+            let body = format!("{} = {}", expr, trimmed);
+            let title = short_preview(&format!("= {}", trimmed));
+            vec![InlineQueryResult::Article(
+                InlineQueryResultArticle::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    title,
+                    InputMessageContent::Text(InputMessageContentText::new(body)),
+                )
+                .description(format!("/calc {}", short_preview(expr))),
+            )]
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let trimmed: String = if text.chars().count() > 200 {
+                let mut s: String = text.chars().take(200).collect();
+                s.push('…');
+                s
+            } else {
+                text
+            };
+            vec![InlineQueryResult::Article(
+                InlineQueryResultArticle::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("\u{26A0}\u{FE0F} {trimmed}"),
+                    InputMessageContent::Text(InputMessageContentText::new(trimmed.clone())),
+                )
+                .description(trimmed),
+            )]
+        }
     }
 }
 
@@ -2999,4 +3089,49 @@ async fn send_typst_pages(
             Ok(())
         }
     }
+}
+
+// ---------- /calc — fend-core numeric calculator ----------
+
+async fn handle_calc(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "util.calc").await {
+        return Ok(());
+    }
+    let expr = rest.trim();
+    if expr.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "пример: /calc 60 mph in m/s, /calc 1/3 + 1/3 + 1/3, /calc 2^256",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let opts = crate::calc::CalcOpts::default();
+    let body = match crate::calc::evaluate(expr, &opts).await {
+        Ok(result) => format!("= {}", truncate_chars(&result, 3500)),
+        Err(e) => {
+            let text = e.to_string();
+            format!("\u{26A0}\u{FE0F} {}", truncate_chars(&text, 600))
+        }
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
