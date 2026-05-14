@@ -216,6 +216,7 @@ const HELP_INLINE: &str = "/inline — переключить расширенн
 * @<бот> typst x^2 + 1 — отрендеренная картинка\n\
 * @<бот> latex \\frac{1}{2} — то же через mitex\n\
 * @<бот> math <код> — кряква сама поймёт диалект\n\
+* @<бот> $$ <код> $$ — то же самое, короче\n\
 * @<бот> creature — зверушка дня\n\
 /inline ещё раз — выключить обратно.\n\
 кря-кря.";
@@ -1079,6 +1080,22 @@ async fn handle_inline(
             .is_personal(true)
             .await?;
         return Ok(());
+    }
+
+    // `$$ ... $$` shortcut: whole query wrapped in double dollars →
+    // auto-detect dialect and render as a photo. Matches the chat-side
+    // `ambient.math.dollar` convention but only available inline (no
+    // false-positive risk because the user typed it deliberately).
+    if let Some(inner) = query.strip_prefix("$$").and_then(|s| s.strip_suffix("$$")) {
+        let expr = inner.trim();
+        if !expr.is_empty() {
+            let results = inline_render(&bot, &config, expr, MathRoute::Auto).await;
+            bot.answer_inline_query(q.id, results)
+                .cache_time(0)
+                .is_personal(true)
+                .await?;
+            return Ok(());
+        }
     }
 
     // Opted-in dispatch on the first word.
