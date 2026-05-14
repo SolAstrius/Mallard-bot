@@ -2054,10 +2054,9 @@ async fn handle_npkg(
             lines.push(format!("🖥 {}", format_platforms(&top.platforms)));
         }
         if !top.maintainers.is_empty() {
-            lines.push(format!(
-                "👥 {}",
-                html_escape(&format_maintainers(&top.maintainers))
-            ));
+            // `format_maintainers` already emits HTML (anchor tags); no
+            // outer escape.
+            lines.push(format!("👥 {}", format_maintainers(&top.maintainers)));
         }
         if let Some(link) = position_to_url(&top.position) {
             let display = top.position.split('/').next_back().unwrap_or(&top.position);
@@ -2273,7 +2272,12 @@ fn format_platforms(csv: &str) -> String {
     parts.join(", ")
 }
 
-/// Format the maintainer CSV — keep github handles with `@`, raw names as-is.
+/// Format the maintainer CSV. Single-token entries are treated as GitHub
+/// handles and rendered as anchor links to `https://github.com/<handle>`
+/// (so Telegram doesn't try to autolink `@name` as a Telegram username).
+/// Multi-word entries are real names and kept as plain (escaped) text.
+///
+/// Returns ready-to-embed HTML — caller must not re-escape.
 fn format_maintainers(csv: &str) -> String {
     csv.split(',')
         .filter_map(|s| {
@@ -2281,10 +2285,12 @@ fn format_maintainers(csv: &str) -> String {
             if s.is_empty() {
                 None
             } else if s.contains(' ') {
-                // Names with spaces: probably a real name (no github handle).
-                Some(s.to_string())
+                Some(html_escape(s))
             } else {
-                Some(format!("@{s}"))
+                let escaped = html_escape(s);
+                Some(format!(
+                    "<a href=\"https://github.com/{escaped}\">@{escaped}</a>"
+                ))
             }
         })
         .collect::<Vec<_>>()
