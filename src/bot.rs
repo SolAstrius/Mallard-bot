@@ -92,6 +92,8 @@ pub enum Command {
     Sym(String),
     #[command(description = "нарисовать график: /plot sin(x), 0, 2*pi")]
     Plot(String),
+    #[command(description = "DNS-тулчейн: /dns <name>, /dns prop, /dns mx, /dns dmarc, /dns help")]
+    Dns(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -300,6 +302,20 @@ const HELP_FEATURE: &str = "/feature — управление флагами к�
 Значения, не подходящие под тип конкретного флага (например `endswith` на bool-флаге), будут проигнорированы при чтении — wildcard-правило с bool-значением не сломает соседний enum-флаг.\n\
 кря-кря.";
 
+const HELP_DNS: &str = "/dns — DNS-тулчейн для sysadmin'ов.\n\
+Подкоманды:\n\
+* /dns <name> [type] [@resolver] — обычный lookup. Тип по умолчанию — A. Резолвер — первый из dns.resolvers.* или конкретная IP/хост через @.\n\
+* /dns prop <name> [type] — таблица пропагации: один запрос на все включённые резолверы, расхождения помечены ⚠️.\n\
+* /dns sec <name> — валидация DNSSEC, плюс наличие DS/DNSKEY на апексе зоны.\n\
+* /dns spf <domain> — раскрыть SPF: ходит по include:/redirect=, считает DNS-lookups против лимита RFC 7208 (10).\n\
+* /dns dmarc <domain> — разобрать DMARC, перевести каждый тег на человеческий.\n\
+* /dns mx <domain> — список MX + PTR + STARTTLS-зонд (subject/issuer/срок) + наличие DANE/TLSA.\n\
+* /dns mta <domain> — MTA-STS-политика (HTTPS-fetch) + TLS-RPT.\n\
+* /dns caa <name> — обход CAA вверх по зоне до первого совпадения.\n\
+Типы записей: A, AAAA, MX, NS, TXT, SOA, CNAME, PTR, CAA, SRV, DS, DNSKEY, TLSA, HTTPS, SVCB, NAPTR, SSHFP, RRSIG, ANY.\n\
+Включённые резолверы и таймаут — через /feature dns.\n\
+кря-кря.";
+
 const HELP_CHA: &str = "/cha — чайная сессия.\n\
 Кряква считает заварки и помнит, кто сейчас пьёт чай.\n\
 * /cha <название> — начать сессию (название — свободный текст)\n\
@@ -341,6 +357,7 @@ fn help_for(query: &str) -> String {
         "calc" => HELP_CALC.to_string(),
         "sym" => HELP_SYM.to_string(),
         "plot" => HELP_PLOT.to_string(),
+        "dns" => HELP_DNS.to_string(),
         "theme" | "dark" => HELP_THEME.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
@@ -629,6 +646,7 @@ async fn handle_command(
         Command::Calc(r) => format!("calc {r}").trim().to_string(),
         Command::Sym(r) => format!("sym {r}").trim().to_string(),
         Command::Plot(r) => format!("plot {r}").trim().to_string(),
+        Command::Dns(r) => format!("dns {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -670,6 +688,7 @@ async fn handle_command(
         Command::Calc(rest) => handle_calc(&bot, &msg, &rest, &config).await,
         Command::Sym(rest) => handle_sym(&bot, &msg, &rest, &config).await,
         Command::Plot(rest) => handle_plot(&bot, &msg, &rest, &config).await,
+        Command::Dns(rest) => handle_dns(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -3614,6 +3633,35 @@ async fn handle_plot(
             .await?;
         }
     }
+    Ok(())
+}
+
+// ---------- /dns — DNS toolkit ----------
+
+async fn handle_dns(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "util.dns").await {
+        return Ok(());
+    }
+    let rules = config
+        .db
+        .feature_rules_for_chat(msg.chat.id.0)
+        .await
+        .unwrap_or_default();
+    let body = crate::dns::handle(rest, &rules).await;
+    // DNS output is wide and monospace-loving — pre-wrap with HTML <pre>.
+    let formatted = format!(
+        "<pre>{}</pre>",
+        html_escape(&truncate_chars(body.trim_end(), 3800))
+    );
+    bot.send_message(msg.chat.id, formatted)
+        .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
     Ok(())
 }
 

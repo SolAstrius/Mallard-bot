@@ -4,6 +4,7 @@ pub mod calc;
 pub mod content;
 pub mod db;
 pub mod dictionaries;
+pub mod dns;
 pub mod exceptions;
 pub mod features;
 pub mod math;

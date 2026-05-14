@@ -135,6 +135,18 @@ pub const FEATURES: &[FeatureDef] = &[
     // ---- ambient: random + scream ----
     FeatureDef { path: "ambient.random", default: "on", ty: TypeSpec::Bool },
     FeatureDef { path: "ambient.scream", default: "on", ty: TypeSpec::Bool },
+
+    // ---- /dns toolkit ----
+    FeatureDef { path: "util.dns", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.resolvers.cloudflare", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.resolvers.google",     default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.resolvers.quad9",      default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.resolvers.opendns",    default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.resolvers.adguard",    default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.resolvers.yandex",     default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.show_ttl",         default: "on",   ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.show_rtt",         default: "on",   ty: TypeSpec::Bool },
+    FeatureDef { path: "dns.parallel_timeout", default: "3000", ty: TypeSpec::Int { min: 500, max: 10000 } },
 ];
 
 pub fn def_of(flag: &str) -> Option<&'static FeatureDef> {
