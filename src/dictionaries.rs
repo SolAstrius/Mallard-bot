@@ -40,6 +40,67 @@ pub enum Keyword {
     Goyda,
 }
 
+impl Keyword {
+    /// Group used in the feature-flag path `ambient.keywords.<group>.<leaf>`.
+    pub const fn group(self) -> &'static str {
+        match self {
+            Self::Kva | Self::Kar | Self::Krya | Self::Hryu | Self::Miu | Self::Mav
+            | Self::Gaing | Self::Woof => "creatures",
+            Self::DaNu | Self::OyVse | Self::Goyda | Self::What | Self::Us | Self::Blin => "memes",
+            Self::Pelmen | Self::Borsch | Self::Chai | Self::Bread => "food",
+            Self::Kiss | Self::Sad | Self::Tired | Self::Hungry | Self::Cold | Self::Sleepy
+            | Self::Hug | Self::MorningCozy | Self::Brat | Self::Cozy | Self::Bunny => "cozy",
+            Self::Arch => "misc",
+        }
+    }
+
+    /// Leaf name used in the feature-flag path; snake_case of the variant.
+    pub const fn leaf(self) -> &'static str {
+        match self {
+            Self::Kva => "kva",
+            Self::Kar => "kar",
+            Self::Krya => "krya",
+            Self::Hryu => "hryu",
+            Self::Miu => "miu",
+            Self::Mav => "mav",
+            Self::Gaing => "gaing",
+            Self::Woof => "woof",
+            Self::Kiss => "kiss",
+            Self::Us => "us",
+            Self::What => "what",
+            Self::Arch => "arch",
+            Self::Pelmen => "pelmen",
+            Self::Borsch => "borsch",
+            Self::Chai => "chai",
+            Self::Blin => "blin",
+            Self::DaNu => "danu",
+            Self::OyVse => "oyvse",
+            Self::Sad => "sad",
+            Self::Tired => "tired",
+            Self::Hungry => "hungry",
+            Self::Cold => "cold",
+            Self::Sleepy => "sleepy",
+            Self::Hug => "hug",
+            Self::MorningCozy => "morning_cozy",
+            Self::Brat => "brat",
+            Self::Cozy => "cozy",
+            Self::Bread => "bread",
+            Self::Bunny => "bunny",
+            Self::Goyda => "goyda",
+        }
+    }
+
+    /// Full feature path for this keyword's per-leaf bool toggle.
+    pub fn flag_path(self) -> String {
+        format!("ambient.keywords.{}.{}", self.group(), self.leaf())
+    }
+
+    /// Feature path for this keyword's group-level match-mode enum.
+    pub fn mode_path(self) -> String {
+        format!("ambient.keywords.{}.mode", self.group())
+    }
+}
+
 /// Substring keyword → Keyword classification. Order matches the Python dict
 /// (Python 3.7+ keeps insertion order) so behaviour is identical.
 pub static TEXT_KEYWORDS: LazyLock<Vec<(&'static str, Keyword)>> = LazyLock::new(|| {

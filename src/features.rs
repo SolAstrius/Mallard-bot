@@ -1,54 +1,148 @@
-//! Hierarchical, pattern-matched per-chat feature flags.
+//! Hierarchical, pattern-matched per-chat feature flags — now typed.
 //!
-//! Names are dotted paths (`nix.npkg`, `util.time.tz`). Rules are stored
-//! per-chat as either an exact path or a trailing-wildcard pattern
-//! (`util.*`, `util.time.*`, `*`). Resolution picks the rule with the
-//! longest literal prefix; if none matches, the in-code default wins.
+//! Each flag has a dotted path (`nix.npkg`, `util.theme.dark`,
+//! `ambient.keywords.memes.mode`) and a registered [`TypeSpec`]: `Bool`,
+//! `Int { min, max }`, or `Enum(&[..])`. Storage is a single TEXT column per
+//! rule; the registry tells callers how to interpret it.
+//!
+//! Rules are stored per-chat as either an exact path or a trailing-wildcard
+//! pattern (`util.*`, `util.time.*`, `*`). Resolution picks the rule with the
+//! longest literal prefix; if the stored value doesn't parse as the leaf's
+//! type, that rule is treated as missing and resolution falls back to the
+//! in-code default. (This lets a wildcard like `ambient.keywords.memes.* off`
+//! cleanly skip a sibling `…mode` enum leaf without erroring.)
 //!
 //! Writes via `/feature` accept the same exact/wildcard forms plus two
 //! shorthands: a category name desugars to `<name>.*` at write time, and
-//! `<prefix>.**` (only with `reset`) recursively deletes every rule
-//! beneath that prefix.
+//! `<prefix>.**` (only with `reset`) recursively deletes every rule beneath
+//! that prefix.
 
 use crate::db::Db;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeSpec {
+    Bool,
+    Int { min: i64, max: i64 },
+    Enum(&'static [&'static str]),
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct FeatureDef {
     pub path: &'static str,
-    pub default: bool,
+    pub default: &'static str,
+    pub ty: TypeSpec,
 }
 
+impl FeatureDef {
+    /// True if `s` is a syntactically-valid value for this flag's type.
+    pub fn validates(&self, s: &str) -> bool {
+        match self.ty {
+            TypeSpec::Bool => parse_bool(s).is_some(),
+            TypeSpec::Int { min, max } => s
+                .parse::<i64>()
+                .ok()
+                .map(|n| n >= min && n <= max)
+                .unwrap_or(false),
+            TypeSpec::Enum(variants) => variants.contains(&s),
+        }
+    }
+}
+
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enable" => Some(true),
+        "off" | "false" | "no" | "0" | "disable" => Some(false),
+        _ => None,
+    }
+}
+
+pub const KEYWORD_MODES: &[&str] = &["contains", "startswith", "endswith", "equals", "word"];
+
 /// Registered leaves. Adding a new command means adding a row here and a
-/// matching `is_enabled` check at the call site.
+/// matching `is_enabled` / `get_*` check at the call site.
+#[rustfmt::skip]
 pub const FEATURES: &[FeatureDef] = &[
-    FeatureDef { path: "fun.roll",      default: true  },
-    FeatureDef { path: "fun.pick",      default: true  },
-    FeatureDef { path: "fun.horoscope", default: true  },
-    FeatureDef { path: "tea.cha",       default: true  },
-    FeatureDef { path: "tea.sip",       default: true  },
-    FeatureDef { path: "nix.npkg",      default: false },
-    FeatureDef { path: "nix.nopt",      default: false },
-    FeatureDef { path: "nix.nixwhere",  default: false },
-    FeatureDef { path: "nix.nchan",     default: false },
-    FeatureDef { path: "nix.nflake",    default: false },
-    FeatureDef { path: "util.typst",    default: true  },
-    FeatureDef { path: "util.latex",    default: true  },
-    FeatureDef { path: "util.math",     default: true  },
-    FeatureDef { path: "util.calc",     default: true  },
-    FeatureDef { path: "util.sym",      default: true  },
-    FeatureDef { path: "util.plot",     default: true  },
-    FeatureDef { path: "util.theme.dark", default: false },
-    FeatureDef { path: "ambient.typst.fenced", default: false },
-    FeatureDef { path: "ambient.latex.fenced", default: false },
-    FeatureDef { path: "ambient.math.dollar",  default: false },
+    // ---- commands ----
+    FeatureDef { path: "fun.roll",       default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "fun.pick",       default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "fun.horoscope",  default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "tea.cha",        default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "tea.sip",        default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "nix.npkg",       default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "nix.nopt",       default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "nix.nixwhere",   default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "nix.nchan",      default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "nix.nflake",     default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "util.typst",     default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "util.latex",     default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "util.math",      default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "util.calc",      default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "util.sym",       default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "util.plot",      default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "util.theme.dark", default: "off", ty: TypeSpec::Bool },
+
+    // ---- ambient: typst/latex/math auto-render ----
+    FeatureDef { path: "ambient.typst.fenced", default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.latex.fenced", default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.math.dollar",  default: "off", ty: TypeSpec::Bool },
+
+    // ---- ambient: text-keyword triggers ----
+    // Per-keyword bools. To turn off the whole group at once:
+    //   /feature ambient.keywords.<group>.* off
+    // Per-group mode picks how a keyword is matched against incoming text.
+    FeatureDef { path: "ambient.keywords.creatures.kva",   default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.kar",   default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.krya",  default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.hryu",  default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.miu",   default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.mav",   default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.gaing", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.woof",  default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.creatures.mode",  default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
+
+    // memes is the noisy group — defaults to a tighter match mode, and the
+    // catchphrase-spammiest leaf (DaNu = "да ладно" / "да ну") ships off.
+    FeatureDef { path: "ambient.keywords.memes.danu",  default: "off", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.memes.oyvse", default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.memes.goyda", default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.memes.what",  default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.memes.us",    default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.memes.blin",  default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.memes.mode",  default: "equals", ty: TypeSpec::Enum(KEYWORD_MODES) },
+
+    FeatureDef { path: "ambient.keywords.food.pelmen", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.food.borsch", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.food.chai",   default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.food.bread",  default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.food.mode",   default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
+
+    FeatureDef { path: "ambient.keywords.cozy.kiss",          default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.sad",           default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.tired",         default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.hungry",        default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.cold",          default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.sleepy",        default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.hug",           default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.morning_cozy",  default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.brat",          default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.cozy",          default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.bunny",         default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.cozy.mode",          default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
+
+    FeatureDef { path: "ambient.keywords.misc.arch", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.keywords.misc.mode", default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
+
+    // ---- ambient: random + scream ----
+    FeatureDef { path: "ambient.random", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.scream", default: "on", ty: TypeSpec::Bool },
 ];
 
-pub fn default_of(flag: &str) -> bool {
-    FEATURES
-        .iter()
-        .find(|f| f.path == flag)
-        .map(|f| f.default)
-        .unwrap_or(true)
+pub fn def_of(flag: &str) -> Option<&'static FeatureDef> {
+    FEATURES.iter().find(|f| f.path == flag)
+}
+
+pub fn default_of(flag: &str) -> &'static str {
+    def_of(flag).map(|f| f.default).unwrap_or("on")
 }
 
 /// Top-level segments in registration order, deduped.
@@ -82,62 +176,110 @@ pub fn specificity(pat: &str) -> usize {
     pat.split('.').take_while(|s| *s != "*").count()
 }
 
-/// Resolve `flag` against `rules`. Returns the value and the winning rule
-/// pattern (or `None` if the default applied).
-pub fn resolve<'a>(rules: &'a [(String, bool)], flag: &str) -> (bool, Option<&'a str>) {
-    let mut best: Option<(&'a str, bool)> = None;
+/// Resolve `flag` against `rules`. Returns the (string) value and the
+/// winning rule pattern (or `None` if the default applied). Rules whose
+/// value doesn't validate against `flag`'s declared type are skipped — a
+/// wildcard rule with a bool value won't shadow a sibling enum leaf.
+pub fn resolve<'a>(rules: &'a [(String, String)], flag: &str) -> (String, Option<&'a str>) {
+    let def = def_of(flag);
+    let mut best: Option<(&'a str, &'a str)> = None;
     for (pat, val) in rules {
         if !pattern_matches(pat, flag) {
             continue;
         }
+        if let Some(d) = def {
+            if !d.validates(val) {
+                continue;
+            }
+        }
         let s = specificity(pat);
         match best {
-            None => best = Some((pat.as_str(), *val)),
-            Some((cur, _)) if s > specificity(cur) => best = Some((pat.as_str(), *val)),
+            None => best = Some((pat.as_str(), val.as_str())),
+            Some((cur, _)) if s > specificity(cur) => best = Some((pat.as_str(), val.as_str())),
             _ => {}
         }
     }
     match best {
-        Some((pat, val)) => (val, Some(pat)),
-        None => (default_of(flag), None),
+        Some((pat, val)) => (val.to_string(), Some(pat)),
+        None => (default_of(flag).to_string(), None),
     }
 }
 
-/// Load the chat's rules from the DB and resolve a single flag. On DB error,
-/// log and fall back to the in-code default — never block a command on a
-/// flag-lookup failure.
+/// Load the chat's rules from the DB and resolve a single flag as bool.
+/// On DB error or type-mismatch, log and fall back to the in-code default
+/// — never block a command on a flag-lookup failure.
 pub async fn is_enabled(db: &Db, chat: i64, flag: &str) -> bool {
+    match db.feature_rules_for_chat(chat).await {
+        Ok(rules) => parse_bool(&resolve(&rules, flag).0).unwrap_or_else(|| {
+            parse_bool(default_of(flag)).unwrap_or(true)
+        }),
+        Err(e) => {
+            log::warn!("feature_rules_for_chat({chat}): {e} — defaulting {flag}");
+            parse_bool(default_of(flag)).unwrap_or(true)
+        }
+    }
+}
+
+/// Load and resolve a flag as a string (used for enum-typed flags).
+pub async fn get_str(db: &Db, chat: i64, flag: &str) -> String {
     match db.feature_rules_for_chat(chat).await {
         Ok(rules) => resolve(&rules, flag).0,
         Err(e) => {
             log::warn!("feature_rules_for_chat({chat}): {e} — defaulting {flag}");
-            default_of(flag)
+            default_of(flag).to_string()
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
-    On,
-    Off,
+    Set(&'static str), // canonical "on"/"off" for bools; for typed values use SetValue.
     Reset,
 }
 
-impl Action {
-    pub fn from_token(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" | "enable" => Some(Self::On),
-            "off" | "false" | "no" | "0" | "disable" => Some(Self::Off),
-            "reset" | "default" | "clear" | "unset" => Some(Self::Reset),
-            _ => None,
+/// Outcome of trying to parse the trailing token(s) of `/feature` as a write.
+/// `None` means "query", `Some(write)` means we have an intent.
+#[derive(Debug)]
+pub enum WriteIntent {
+    Bool(bool),
+    /// For non-bool flags: pass the raw token through; the resolver
+    /// validates against each target leaf's TypeSpec.
+    Literal(String),
+    Reset,
+}
+
+impl WriteIntent {
+    /// Recognize reset/clear keywords; bool tokens; or anything else as
+    /// a literal value to be type-checked per-leaf.
+    pub fn parse(s: &str) -> Self {
+        let lower = s.to_ascii_lowercase();
+        match lower.as_str() {
+            "reset" | "default" | "clear" | "unset" => Self::Reset,
+            _ => match parse_bool(s) {
+                Some(b) => Self::Bool(b),
+                None => Self::Literal(s.to_string()),
+            },
         }
     }
 
     pub fn verb(&self) -> &'static str {
         match self {
-            Self::On => "включён",
-            Self::Off => "выключен",
+            Self::Bool(true) => "включён",
+            Self::Bool(false) => "выключен",
+            Self::Literal(_) => "установлен",
             Self::Reset => "сброшен",
+        }
+    }
+
+    /// Stored value if this intent applies to `def`. Returns `None` when
+    /// the intent doesn't match the leaf's type.
+    pub fn stored_for(&self, def: &FeatureDef) -> Option<String> {
+        match (self, def.ty) {
+            (Self::Bool(b), TypeSpec::Bool) => Some(if *b { "on" } else { "off" }.to_string()),
+            (Self::Bool(_), _) => None,
+            (Self::Literal(s), _) if def.validates(s) => Some(s.clone()),
+            (Self::Literal(_), _) => None,
+            (Self::Reset, _) => None, // handled by clear path
         }
     }
 }
@@ -172,12 +314,7 @@ impl Pattern {
     }
 }
 
-/// Validate + normalize a user-supplied pattern. The input may be:
-///   - an exact registered leaf path           → `Exact`
-///   - `<prefix>.*` covering registered leaves → `Wildcard`
-///   - bare `*`                                → `Wildcard("*")`
-///   - a category/prefix without trailing `.*` → desugars to `Wildcard(<prefix>.*)`
-///   - `<prefix>.**`                           → `Recursive(<prefix>)`
+/// Validate + normalize a user-supplied pattern.
 pub fn normalize_pattern(raw: &str) -> Result<Pattern, String> {
     let input = raw.trim();
     if input.is_empty() {
@@ -262,6 +399,20 @@ pub fn leaves_matching(pat: &Pattern) -> Vec<&'static FeatureDef> {
         .collect()
 }
 
+/// Render a stored value with a hint of its type — for the overview UI.
+/// `value` may be either the raw stored string (when there's an explicit
+/// rule) or the resolved default.
+pub fn pretty_value(def: &FeatureDef, value: &str) -> String {
+    match def.ty {
+        TypeSpec::Bool => match parse_bool(value) {
+            Some(true) => "\u{2705}".to_string(),
+            Some(false) => "\u{274C}".to_string(),
+            None => format!("?{value}"),
+        },
+        TypeSpec::Int { .. } | TypeSpec::Enum(_) => value.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,38 +422,72 @@ mod tests {
         assert!(pattern_matches("nix.npkg", "nix.npkg"));
         assert!(!pattern_matches("nix.npkg", "nix.nopt"));
         assert!(pattern_matches("nix.*", "nix.npkg"));
-        assert!(pattern_matches("nix.*", "nix")); // edge: nix.* matches "nix" itself
+        assert!(pattern_matches("nix.*", "nix"));
         assert!(!pattern_matches("nix.*", "tea.cha"));
         assert!(pattern_matches("*", "anything.you.want"));
-        assert!(pattern_matches("util.time.*", "util.time.tz"));
-        assert!(!pattern_matches("util.time.*", "util.numbers.conv"));
     }
 
     #[test]
-    fn specificity_ordering() {
-        assert!(specificity("util.time.tz") > specificity("util.time.*"));
-        assert!(specificity("util.time.*") > specificity("util.*"));
-        assert!(specificity("util.*") > specificity("*"));
-    }
-
-    #[test]
-    fn resolve_picks_most_specific() {
+    fn resolve_picks_most_specific_typed() {
         let rules = vec![
-            ("nix.*".to_string(), true),
-            ("nix.npkg".to_string(), false),
+            ("nix.*".to_string(), "on".to_string()),
+            ("nix.npkg".to_string(), "off".to_string()),
         ];
-        // exact beats wildcard
-        assert!(!resolve(&rules, "nix.npkg").0);
-        // wildcard wins when no exact rule exists
-        assert!(resolve(&rules, "nix.nopt").0);
+        assert_eq!(resolve(&rules, "nix.npkg").0, "off");
+        assert_eq!(resolve(&rules, "nix.nopt").0, "on");
+    }
+
+    #[test]
+    fn resolve_skips_type_mismatched_wildcard() {
+        // bool-y wildcard rule shadows a sibling enum leaf? It must not.
+        let rules = vec![("ambient.keywords.memes.*".to_string(), "off".to_string())];
+        // memes.mode is enum; "off" isn't a valid mode → falls back to default.
+        let (v, by) = resolve(&rules, "ambient.keywords.memes.mode");
+        assert_eq!(v, "equals");
+        assert!(by.is_none());
+        // memes.danu is bool; "off" is fine.
+        assert_eq!(resolve(&rules, "ambient.keywords.memes.danu").0, "off");
     }
 
     #[test]
     fn resolve_falls_back_to_default() {
-        // fun.roll has default = true
-        assert!(resolve(&[], "fun.roll").0);
-        // nix.npkg has default = false
-        assert!(!resolve(&[], "nix.npkg").0);
+        assert_eq!(resolve(&[], "fun.roll").0, "on");
+        assert_eq!(resolve(&[], "nix.npkg").0, "off");
+        assert_eq!(resolve(&[], "ambient.keywords.memes.mode").0, "equals");
+    }
+
+    #[test]
+    fn write_intent_parses() {
+        assert!(matches!(WriteIntent::parse("on"), WriteIntent::Bool(true)));
+        assert!(matches!(WriteIntent::parse("off"), WriteIntent::Bool(false)));
+        assert!(matches!(WriteIntent::parse("reset"), WriteIntent::Reset));
+        match WriteIntent::parse("endswith") {
+            WriteIntent::Literal(s) => assert_eq!(s, "endswith"),
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    #[test]
+    fn stored_for_validates_type() {
+        let bool_def = def_of("fun.roll").unwrap();
+        assert_eq!(
+            WriteIntent::Bool(true).stored_for(bool_def).as_deref(),
+            Some("on")
+        );
+        assert!(WriteIntent::Literal("endswith".into()).stored_for(bool_def).is_none());
+
+        let mode_def = def_of("ambient.keywords.memes.mode").unwrap();
+        assert_eq!(
+            WriteIntent::Literal("endswith".into())
+                .stored_for(mode_def)
+                .as_deref(),
+            Some("endswith")
+        );
+        assert!(WriteIntent::Literal("nonsense".into())
+            .stored_for(mode_def)
+            .is_none());
+        // bool intent on enum leaf → rejected
+        assert!(WriteIntent::Bool(true).stored_for(mode_def).is_none());
     }
 
     #[test]
@@ -315,7 +500,6 @@ mod tests {
             normalize_pattern("nix.*").unwrap(),
             Pattern::Wildcard(s) if s == "nix.*"
         ));
-        // category shorthand desugars
         assert!(matches!(
             normalize_pattern("nix").unwrap(),
             Pattern::Wildcard(s) if s == "nix.*"
@@ -333,9 +517,8 @@ mod tests {
     #[test]
     fn normalize_rejects_unknown_and_bad_syntax() {
         assert!(normalize_pattern("util.bogus").is_err());
-        assert!(normalize_pattern("util.time").is_err()); // no util.time.* registered yet
-        assert!(normalize_pattern("Nix.NPKG").is_err()); // case-sensitive
-        assert!(normalize_pattern("nix..npkg").is_err()); // empty segment
+        assert!(normalize_pattern("Nix.NPKG").is_err());
+        assert!(normalize_pattern("nix..npkg").is_err());
         assert!(normalize_pattern("").is_err());
     }
 }

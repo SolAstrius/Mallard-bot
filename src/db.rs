@@ -16,6 +16,35 @@ pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Bring pre-typed-features databases up to the current `chat_features`
+/// shape: ensure a `value TEXT` column exists, backfilled from the legacy
+/// `enabled INTEGER` if present. Idempotent — safe to call on every open.
+fn migrate_chat_features_to_typed(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(chat_features)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    let has_value = cols.iter().any(|c| c == "value");
+    let has_enabled = cols.iter().any(|c| c == "enabled");
+
+    if !has_value {
+        // Pre-typed schema: add the column, then backfill from `enabled`.
+        conn.execute(
+            "ALTER TABLE chat_features ADD COLUMN value TEXT NOT NULL DEFAULT 'on'",
+            [],
+        )?;
+        if has_enabled {
+            conn.execute(
+                "UPDATE chat_features SET value = CASE enabled WHEN 1 THEN 'on' ELSE 'off' END",
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS cha_sessions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,11 +117,15 @@ CREATE TABLE IF NOT EXISTS inline_opt_in (
 );
 
 -- Per-chat per-feature toggle. Missing row → use the in-code default for that
--- feature name. Lets a chat opt out of `cha`/`roll` or opt into `npkg`/`nopt`.
+-- feature name. `value` is the stored value as a string; the in-code registry
+-- (`crate::features::FEATURES`) declares each flag's type (bool / int / enum)
+-- and the resolver parses on read. The legacy `enabled INTEGER` column may
+-- exist on pre-typed-features databases; `Db::open` runs a migration that
+-- backfills `value` from it if needed.
 CREATE TABLE IF NOT EXISTS chat_features (
     chat_id INTEGER NOT NULL,
     feature TEXT    NOT NULL,
-    enabled INTEGER NOT NULL,
+    value   TEXT    NOT NULL DEFAULT 'on',
     PRIMARY KEY (chat_id, feature)
 );
 
@@ -135,6 +168,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_chat_features_to_typed(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -554,16 +588,17 @@ impl Db {
         &self,
         chat_id: i64,
         feature: &str,
-        enabled: bool,
+        value: &str,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.clone();
         let feature = feature.to_string();
+        let value = value.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO chat_features(chat_id, feature, enabled) VALUES(?1, ?2, ?3)
-                 ON CONFLICT(chat_id, feature) DO UPDATE SET enabled = excluded.enabled",
-                rusqlite::params![chat_id, feature, if enabled { 1 } else { 0 }],
+                "INSERT INTO chat_features(chat_id, feature, value) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(chat_id, feature) DO UPDATE SET value = excluded.value",
+                rusqlite::params![chat_id, feature, value],
             )?;
             Ok::<_, rusqlite::Error>(())
         })
@@ -571,22 +606,23 @@ impl Db {
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
 
-    /// All rules (pattern, enabled) for a chat. Used by the hierarchical
-    /// resolver in [`crate::features`].
+    /// All rules (pattern, value) for a chat. Used by the hierarchical
+    /// resolver in [`crate::features`]. Values are strings; the registry
+    /// declares the type and the resolver parses on read.
     pub async fn feature_rules_for_chat(
         &self,
         chat_id: i64,
-    ) -> rusqlite::Result<Vec<(String, bool)>> {
+    ) -> rusqlite::Result<Vec<(String, String)>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn.prepare(
-                "SELECT feature, enabled FROM chat_features WHERE chat_id = ?1 ORDER BY feature",
+                "SELECT feature, value FROM chat_features WHERE chat_id = ?1 ORDER BY feature",
             )?;
             let rows = stmt.query_map(rusqlite::params![chat_id], |row| {
                 let pat: String = row.get(0)?;
-                let en: i64 = row.get(1)?;
-                Ok((pat, en != 0))
+                let val: String = row.get(1)?;
+                Ok((pat, val))
             })?;
             let mut out = Vec::new();
             for r in rows {

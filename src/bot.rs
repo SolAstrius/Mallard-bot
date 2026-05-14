@@ -18,7 +18,7 @@ use crate::arguments::{parse_photo_arguments, parse_video_arguments, PhotoQuoteA
 use crate::content::random_emoji;
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
 use crate::imaging::{image_to_emoji, image_to_sticker, FilePreprocessType};
-use crate::mallard::Mallard;
+use crate::mallard::{self, MatchMode, Mallard};
 use crate::quote::render_quote;
 use crate::responses::ResponseType;
 use crate::stickerpack::{PackKind, StickerPack};
@@ -282,16 +282,22 @@ const HELP_INLINE: &str = "/inline — переключить расширенн
 кря-кря.";
 
 const HELP_FEATURE: &str = "/feature — управление флагами команд в этом чате.\n\
-Имена флагов — это пути с точками (`fun.roll`, `nix.npkg`).\n\
+Имена флагов — это пути с точками (`fun.roll`, `nix.npkg`, `ambient.keywords.memes.mode`).\n\
+У каждого флага свой тип: bool (on/off), enum (одно из нескольких значений), int.\n\
 Просмотр:\n\
 * /feature — все флаги и активные правила.\n\
 * /feature nix — состояние всего поддерева nix.\n\
+* /feature ambient.keywords.memes — все мемные триггеры и режим.\n\
 Изменение (только для админов чата):\n\
-* /feature nix.* on — включить всё под nix.\n\
+* /feature nix.* on — включить всё под nix (bool).\n\
 * /feature nix.npkg off — выключить конкретный флаг.\n\
+* /feature ambient.keywords.memes.mode endswith — задать режим сопоставления.\n\
+  доступные режимы: contains, startswith, endswith, equals, word.\n\
+* /feature ambient.keywords.memes.* off — выключить весь мемный набор разом.\n\
 * /feature fun.roll, nix.* reset — снять правила с перечисленных шаблонов.\n\
 * /feature util.** reset — рекурсивно удалить все правила под util.*.\n\
-Правило с более длинным буквенным префиксом побеждает: /feature nix.* on плюс /feature nix.npkg off оставляет npkg выключенным, а остальное nix-* включённым.\n\
+Правило с более длинным буквенным префиксом побеждает: /feature ambient.keywords.memes.* off + /feature ambient.keywords.memes.goyda on оставит goyda работать, остальное мемное молчит.\n\
+Значения, не подходящие под тип конкретного флага (например `endswith` на bool-флаге), будут проигнорированы при чтении — wildcard-правило с bool-значением не сломает соседний enum-флаг.\n\
 кря-кря.";
 
 const HELP_CHA: &str = "/cha — чайная сессия.\n\
@@ -452,10 +458,29 @@ async fn handle_text(
         None => return Ok(()),
     };
 
-    let reply = { mallard.lock().await.process(&text) };
-    let Some((reply_text, reply_type)) = reply else {
+    let chat = msg.chat.id;
+    let rules = config
+        .db
+        .feature_rules_for_chat(chat.0)
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("feature_rules_for_chat({chat}): {e}");
+            Vec::new()
+        });
+
+    let response = pick_ambient_response(&text, &rules, &mallard).await;
+    let Some((reply_text, reply_type, quote)) = response else {
         return Ok(());
     };
+
+    let scream_on = features::parse_bool(&features::resolve(&rules, "ambient.scream").0)
+        .unwrap_or(true);
+    let (reply_text, reply_type) = if scream_on {
+        mallard::maybe_scream((reply_text, reply_type))
+    } else {
+        (reply_text, reply_type)
+    };
+
     log::info!(
         "echo from {}: {:?} → {:?} {:.40?}",
         origin(&msg),
@@ -463,8 +488,17 @@ async fn handle_text(
         reply_type,
         reply_text
     );
+
+    let mut rp = reply_params(&msg);
+    if let Some((q, pos)) = quote {
+        // Telegram caps quotes at 1024 chars after entity parsing, but the
+        // matched substrings here are short keyword phrases — well under
+        // the limit.
+        rp.quote = Some(q);
+        rp.quote_position = Some(pos);
+    }
+
     let target = msg.chat.id;
-    let rp = reply_params(&msg);
     match reply_type {
         ResponseType::Text => {
             bot.send_message(target, reply_text)
@@ -484,6 +518,79 @@ async fn handle_text(
         }
     }
     Ok(())
+}
+
+/// Resolve the ambient pipeline for one incoming text message. Returns the
+/// reply (with its quote, if any) or `None` if nothing should fire.
+///
+/// Pipeline order:
+///   1. Keyword candidates — substring scan from `mallard::scan_keywords`.
+///   2. Per-keyword bool filter (`ambient.keywords.<group>.<leaf>`).
+///   3. Per-group mode re-test (`ambient.keywords.<group>.mode`).
+///   4. Random pick from survivors; the quote is the matched substring.
+///   5. If nothing matched, fall back to the random roulette (gated by
+///      `ambient.random`); the random reply isn't tied to any substring so
+///      no quote is attached.
+async fn pick_ambient_response(
+    text: &str,
+    rules: &[(String, String)],
+    mallard: &SharedMallard,
+) -> Option<(String, ResponseType, Option<(String, u32)>)> {
+    let upper = text.to_uppercase();
+    let candidates = mallard::scan_keywords(text);
+
+    let mut survivors: Vec<(crate::dictionaries::Keyword, (usize, usize))> = Vec::new();
+    for cand in &candidates {
+        let kw = cand.keyword;
+        let flag = kw.flag_path();
+        let enabled = features::parse_bool(&features::resolve(rules, &flag).0).unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let mode_str = features::resolve(rules, &kw.mode_path()).0;
+        let mode = MatchMode::parse(&mode_str).unwrap_or(MatchMode::Contains);
+
+        // Re-test under the mode using every trigger string registered for
+        // this keyword — multiple substrings can map to the same Keyword
+        // (e.g. "ДА НУ" and "ДА ЛАДНО" both → DaNu).
+        let span = crate::dictionaries::TEXT_KEYWORDS
+            .iter()
+            .filter(|(_, k)| *k == kw)
+            .find_map(|(kw_str, _)| mallard::match_keyword(mode, &upper, kw_str));
+        if let Some(span) = span {
+            survivors.push((kw, span));
+        }
+    }
+
+    if !survivors.is_empty() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let pick = survivors[rng.gen_range(0..survivors.len())];
+        let (reply_text, reply_type) = mallard::pick_reply(pick.0)?;
+        let (start, end) = pick.1;
+        let quote_str = text.get(start..end).map(str::to_string);
+        let quote_pos = utf16_offset(text, start);
+        let quote = quote_str.map(|q| (q, quote_pos));
+        return Some((reply_text, reply_type, quote));
+    }
+
+    let random_on = features::parse_bool(&features::resolve(rules, "ambient.random").0)
+        .unwrap_or(true);
+    if !random_on {
+        return None;
+    }
+    let (text, ty) = mallard.lock().await.generate_random_answer()?;
+    Some((text, ty, None))
+}
+
+/// Telegram counts `quote_position` in UTF-16 code units, not bytes. Convert
+/// `byte_pos` (in the original UTF-8 string) to its UTF-16 offset by summing
+/// `len_utf16()` for every char preceding the position.
+fn utf16_offset(s: &str, byte_pos: usize) -> u32 {
+    s[..byte_pos.min(s.len())]
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum()
 }
 
 async fn handle_command(
@@ -2319,7 +2426,7 @@ fn position_to_url(position: &str) -> Option<String> {
 
 // ---------- per-chat feature toggles ----------
 
-use crate::features::{self, Action as FeatureAction, Pattern as FeaturePattern};
+use crate::features::{self, Pattern as FeaturePattern, WriteIntent};
 
 /// Thin call-site wrapper around [`features::is_enabled`] that takes the
 /// teloxide [`ChatId`] directly.
@@ -2376,12 +2483,25 @@ async fn handle_feature(
         return Ok(());
     }
 
-    // Last token may be an action token — if so this is a write, else it's
-    // a scoped query over the listed prefixes.
-    let action = FeatureAction::from_token(tokens[tokens.len() - 1]);
-    let pattern_slice: &[&str] = match action {
-        Some(_) => &tokens[..tokens.len() - 1],
-        None => &tokens[..],
+    // Last token may be a write intent (on/off/reset/<value>) — if it doesn't
+    // resolve to a stored-value form for any matching leaf, this is a query.
+    // We commit to "write" iff the last token is one of the bool/reset
+    // synonyms, OR it parses as a value for at least one of the leaves named
+    // earlier in the command. That avoids surprising "/feature x" → write.
+    let last = tokens[tokens.len() - 1];
+    let parsed_intent = WriteIntent::parse(last);
+    let is_bool_or_reset = matches!(parsed_intent, WriteIntent::Bool(_) | WriteIntent::Reset);
+    // For Literal intent, defer the write/query decision to after pattern
+    // resolution (we need the leaves to know if it's a valid value).
+    let (intent, pattern_slice): (Option<WriteIntent>, &[&str]) = if is_bool_or_reset {
+        (Some(parsed_intent), &tokens[..tokens.len() - 1])
+    } else if tokens.len() >= 2 {
+        // Heuristic: a non-bool trailing token is treated as a value-write only
+        // if there's at least one pattern token before it. The validity check
+        // happens later, per-leaf.
+        (Some(parsed_intent), &tokens[..tokens.len() - 1])
+    } else {
+        (None, &tokens[..])
     };
 
     // Split on commas as well as whitespace; dedupe in input order.
@@ -2419,7 +2539,7 @@ async fn handle_feature(
     }
 
     // ===== Query path =====
-    if action.is_none() {
+    let Some(intent) = intent else {
         let rules = config
             .db
             .feature_rules_for_chat(chat.0)
@@ -2439,11 +2559,9 @@ async fn handle_feature(
             .reply_parameters(reply_params(msg))
             .await?;
         return Ok(());
-    }
+    };
 
     // ===== Write path =====
-    let action = action.unwrap();
-
     if !can_manage_features(bot, msg, config).await {
         bot.send_message(chat, "не ква, только админы чата могут это менять.")
             .reply_parameters(reply_params(msg))
@@ -2451,16 +2569,16 @@ async fn handle_feature(
         return Ok(());
     }
 
-    // `<prefix>.**` is reset-only — refuse on/off early so the user sees the
-    // mistake before any DB write happens.
-    if matches!(action, FeatureAction::On | FeatureAction::Off)
+    // `<prefix>.**` is reset-only — refuse non-reset writes early so the
+    // user sees the mistake before any DB write happens.
+    if !matches!(intent, WriteIntent::Reset)
         && patterns
             .iter()
             .any(|p| matches!(p, FeaturePattern::Recursive(_)))
     {
         bot.send_message(
             chat,
-            "** работает только с reset. для on/off укажите конкретный шаблон, например util.* on",
+            "** работает только с reset. для on/off/значений укажите конкретный шаблон, например util.* on",
         )
         .reply_parameters(reply_params(msg))
         .await?;
@@ -2469,25 +2587,15 @@ async fn handle_feature(
 
     let mut applied: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut type_mismatch: Vec<String> = Vec::new();
     for p in &patterns {
-        let outcome: Result<String, rusqlite::Error> = match (action, p) {
-            (FeatureAction::On | FeatureAction::Off, _) => {
-                let stored = p
-                    .stored()
-                    .expect("recursive patterns rejected above for on/off");
-                let val = matches!(action, FeatureAction::On);
-                config
-                    .db
-                    .feature_set(chat.0, stored, val)
-                    .await
-                    .map(|()| p.display())
-            }
-            (FeatureAction::Reset, FeaturePattern::Recursive(prefix)) => config
+        let outcome: Result<String, rusqlite::Error> = match (&intent, p) {
+            (WriteIntent::Reset, FeaturePattern::Recursive(prefix)) => config
                 .db
                 .feature_clear_prefix(chat.0, prefix)
                 .await
                 .map(|n| format!("{} ({n})", p.display())),
-            (FeatureAction::Reset, _) => {
+            (WriteIntent::Reset, _) => {
                 let stored = p.stored().expect("non-recursive has a stored form");
                 config
                     .db
@@ -2495,18 +2603,46 @@ async fn handle_feature(
                     .await
                     .map(|()| p.display())
             }
+            // Bool / Literal writes: validate the value against every leaf
+            // the pattern matches. If at least one leaf accepts it, store
+            // the value verbatim against the pattern. (For wildcards, the
+            // resolver's type-mismatch fallback handles non-matching leaves
+            // at read time, so storing once is enough.)
+            (intent_val, _) => {
+                let leaves = features::leaves_matching(p);
+                let accepting: Vec<_> = leaves
+                    .iter()
+                    .filter(|d| intent_val.stored_for(d).is_some())
+                    .collect();
+                if accepting.is_empty() {
+                    type_mismatch.push(p.display());
+                    Ok(String::new())
+                } else {
+                    let stored_value = accepting
+                        .first()
+                        .and_then(|d| intent_val.stored_for(d))
+                        .expect("at least one accepting leaf");
+                    let stored = p.stored().expect("non-recursive has a stored form");
+                    config
+                        .db
+                        .feature_set(chat.0, stored, &stored_value)
+                        .await
+                        .map(|()| format!("{} = {}", p.display(), stored_value))
+                }
+            }
         };
         match outcome {
+            Ok(label) if label.is_empty() => {} // type-mismatch; reported separately
             Ok(label) => applied.push(label),
             Err(e) => {
-                log::warn!("feature {:?} {}: {e}", action, p.display());
+                log::warn!("feature {:?} {}: {e}", intent, p.display());
                 failed.push(p.display());
             }
         }
     }
 
     // Recompute effective state across leaves touched by the patterns we
-    // applied, so the user sees the resolved ✅/❌.
+    // applied, so the user sees the resolved value.
     let rules = config
         .db
         .feature_rules_for_chat(chat.0)
@@ -2515,9 +2651,13 @@ async fn handle_feature(
     let mut effective: Vec<String> = Vec::new();
     for p in &patterns {
         for leaf in features::leaves_matching(p) {
-            let (on, _) = features::resolve(&rules, leaf.path);
-            let mark = if on { "\u{2705}" } else { "\u{274C}" };
-            effective.push(format!("  {mark} {}", leaf.path));
+            let (v, _) = features::resolve(&rules, leaf.path);
+            effective.push(format!(
+                "  {} {} = {}",
+                features::pretty_value(leaf, &v),
+                leaf.path,
+                v
+            ));
         }
     }
     effective.sort();
@@ -2525,7 +2665,7 @@ async fn handle_feature(
 
     let mut lines: Vec<String> = Vec::new();
     if !applied.is_empty() {
-        lines.push(format!("{}: {}", action.verb(), applied.join(", ")));
+        lines.push(format!("{}: {}", intent.verb(), applied.join(", ")));
     }
     if !effective.is_empty() {
         lines.push("сейчас:".to_string());
@@ -2533,6 +2673,9 @@ async fn handle_feature(
     }
     if !bad.is_empty() {
         lines.push(format!("пропущено: {}", bad.join("; ")));
+    }
+    if !type_mismatch.is_empty() {
+        lines.push(format!("неподходящий тип: {}", type_mismatch.join(", ")));
     }
     if !failed.is_empty() {
         lines.push(format!("ошибка: {}", failed.join(", ")));
@@ -2547,9 +2690,9 @@ async fn handle_feature(
     Ok(())
 }
 
-/// Full per-chat state: declared rules + effective on/off for every
+/// Full per-chat state: declared rules + effective value for every
 /// registered leaf, grouped by top-level category.
-fn render_feature_overview(chat_id: i64, rules: &[(String, bool)]) -> String {
+fn render_feature_overview(chat_id: i64, rules: &[(String, String)]) -> String {
     let mut lines: Vec<String> = vec![format!("\u{2699}\u{FE0F} флаги в чате {chat_id}:")];
 
     if rules.is_empty() {
@@ -2557,8 +2700,7 @@ fn render_feature_overview(chat_id: i64, rules: &[(String, bool)]) -> String {
     } else {
         lines.push("правила:".to_string());
         for (pat, val) in rules {
-            let mark = if *val { "on " } else { "off" };
-            lines.push(format!("  {mark}  {pat}"));
+            lines.push(format!("  {pat} = {val}"));
         }
     }
 
@@ -2575,28 +2717,33 @@ fn render_feature_overview(chat_id: i64, rules: &[(String, bool)]) -> String {
                 lines.push(format!("  [{cat}]"));
                 header_pushed = true;
             }
-            let (on, by) = features::resolve(rules, f.path);
-            let mark = if on { "\u{2705}" } else { "\u{274C}" };
+            let (v, by) = features::resolve(rules, f.path);
             let src = by
                 .map(|r| format!("← {r}"))
                 .unwrap_or_else(|| "← по умолчанию".to_string());
-            lines.push(format!("    {mark} {} {src}", f.path));
+            lines.push(format!(
+                "    {} {} = {} {src}",
+                features::pretty_value(f, &v),
+                f.path,
+                v
+            ));
         }
     }
 
     lines.push(String::new());
     lines.push(
-        "управление (для админов): /feature <шаблон>[, <шаблон>] on|off|reset".to_string(),
+        "управление (для админов): /feature <шаблон>[, <шаблон>] on|off|<значение>|reset"
+            .to_string(),
     );
     lines.push(
-        "примеры: /feature nix.* on; /feature util.time.tz off; /feature util.** reset".to_string(),
+        "примеры: /feature nix.* on; /feature ambient.keywords.memes.mode endswith; /feature util.** reset".to_string(),
     );
     lines.join("\n")
 }
 
 /// Effective state for the leaves under one pattern. Used by the
 /// `/feature <prefix>` query form.
-fn render_feature_subtree(rules: &[(String, bool)], pat: &FeaturePattern) -> String {
+fn render_feature_subtree(rules: &[(String, String)], pat: &FeaturePattern) -> String {
     let mut lines = vec![format!("[{}]", pat.display())];
     let leaves = features::leaves_matching(pat);
     if leaves.is_empty() {
@@ -2604,12 +2751,16 @@ fn render_feature_subtree(rules: &[(String, bool)], pat: &FeaturePattern) -> Str
         return lines.join("\n");
     }
     for leaf in leaves {
-        let (on, by) = features::resolve(rules, leaf.path);
-        let mark = if on { "\u{2705}" } else { "\u{274C}" };
+        let (v, by) = features::resolve(rules, leaf.path);
         let src = by
             .map(|r| format!("← {r}"))
             .unwrap_or_else(|| "← по умолчанию".to_string());
-        lines.push(format!("  {mark} {} {src}", leaf.path));
+        lines.push(format!(
+            "  {} {} = {} {src}",
+            features::pretty_value(leaf, &v),
+            leaf.path,
+            v
+        ));
     }
     lines.join("\n")
 }
