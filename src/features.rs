@@ -36,6 +36,7 @@ pub const FEATURES: &[FeatureDef] = &[
     FeatureDef { path: "util.math",     default: true  },
     FeatureDef { path: "util.calc",     default: true  },
     FeatureDef { path: "util.sym",      default: true  },
+    FeatureDef { path: "util.plot",     default: true  },
     FeatureDef { path: "ambient.typst.fenced", default: false },
     FeatureDef { path: "ambient.latex.fenced", default: false },
     FeatureDef { path: "ambient.math.dollar",  default: false },

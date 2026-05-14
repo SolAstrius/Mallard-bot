@@ -11,6 +11,7 @@ pub mod imaging;
 pub mod mallard;
 pub mod nixsearch;
 pub mod nixstatus;
+pub mod plot;
 pub mod quote;
 pub mod responses;
 pub mod sessions;

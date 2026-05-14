@@ -90,6 +90,8 @@ pub enum Command {
     Calc(String),
     #[command(description = "символьные штуки: /sym diff(sin(x), x), /sym factor(x^2-1), /sym expand((x+1)^3)")]
     Sym(String),
+    #[command(description = "нарисовать график: /plot sin(x), 0, 2*pi")]
+    Plot(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -225,6 +227,16 @@ const HELP_CALC: &str = "/calc <выражение> — посчитать. По
 Для символьных штук (производные, упрощение) будет отдельный /sym.\n\
 кря-кря.";
 
+const HELP_PLOT: &str = "/plot <выражение>, <от>, <до> — нарисовать график. Через typst + cetz-plot.\n\
+Примеры:\n\
+* /plot sin(x), 0, 2*pi — одна функция\n\
+* /plot sin(x), cos(x), -pi, pi — несколько функций на одной картинке\n\
+* /plot exp(-x^2), -3, 3 — гауссиана\n\
+* /plot exp(-x/3) * cos(x), 0, 10 — затухающие колебания\n\
+Поддерживаемые функции: sin, cos, tan, asin, acos, atan, sinh, cosh, tanh, exp, ln, log, sqrt, abs, pow. Константы: pi, e. Степень: x^2 (то же что pow(x, 2)).\n\
+Границы диапазона принимают число, pi, -pi, e, N*pi, pi/N.\n\
+кря-кря.";
+
 const HELP_SYM: &str = "/sym <выражение> — символьные операции через symbolica. Кряква пришлёт ответ текстом и красиво отрисованной картинкой.\n\
 Что умеет:\n\
 * expand(<выр>) — раскрыть скобки: /sym expand((x+1)^3)\n\
@@ -248,6 +260,7 @@ const HELP_INLINE: &str = "/inline — переключить расширенн
 * @<бот> $$<код>$$ — кряква отрендерит\n\
 * @<бот> calc 60 mph in m/s — посчитать\n\
 * @<бот> $2^256$ — кряква посчитает\n\
+* @<бот> plot sin(x), 0, 2*pi — нарисовать график\n\
 * @<бот> creature — зверушка дня\n\
 /inline ещё раз — выключить обратно.\n\
 кря-кря.";
@@ -305,6 +318,7 @@ fn help_for(query: &str) -> String {
         "inline" => HELP_INLINE.to_string(),
         "calc" => HELP_CALC.to_string(),
         "sym" => HELP_SYM.to_string(),
+        "plot" => HELP_PLOT.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -490,6 +504,7 @@ async fn handle_command(
         Command::Inline => "inline".to_string(),
         Command::Calc(r) => format!("calc {r}").trim().to_string(),
         Command::Sym(r) => format!("sym {r}").trim().to_string(),
+        Command::Plot(r) => format!("plot {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -530,6 +545,7 @@ async fn handle_command(
         Command::Inline => handle_inline_toggle(&bot, &msg, &config).await,
         Command::Calc(rest) => handle_calc(&bot, &msg, &rest, &config).await,
         Command::Sym(rest) => handle_sym(&bot, &msg, &rest, &config).await,
+        Command::Plot(rest) => handle_plot(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -1166,13 +1182,14 @@ async fn handle_inline(
         }
         "math" | "/math" => inline_render(&bot, &config, rest, MathRoute::Auto).await,
         "calc" | "c" | "/calc" => inline_calc(rest).await,
+        "plot" | "/plot" => inline_plot(&bot, &config, rest).await,
         "creature" | "ква" | "/creature" => {
             let creature = { mallard.lock().await.get_creature().to_string() };
             vec![inline_creature_result(&creature, None)]
         }
         _ => {
             let creature = { mallard.lock().await.get_creature().to_string() };
-            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, typst, latex, math, calc, creature.";
+            let hint = "не ква, такой команды у кряквы пока нет в инлайне. умеет: roll, pick, horoscope, typst, latex, math, calc, plot, creature.";
             vec![inline_creature_result(&creature, Some(hint))]
         }
     };
@@ -1337,6 +1354,52 @@ fn short_preview(s: &str) -> String {
         t
     } else {
         stripped
+    }
+}
+
+async fn inline_plot(bot: &Bot, config: &BotConfig, rest: &str) -> Vec<InlineQueryResult> {
+    let args = rest.trim();
+    if args.is_empty() {
+        let body = "пример: plot sin(x), 0, 2*pi";
+        return vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+            uuid::Uuid::new_v4().to_string(),
+            body,
+            InputMessageContent::Text(InputMessageContentText::new(body.to_string())),
+        ))];
+    }
+    match plot_to_file_ids(bot, config, args).await {
+        Ok(ids) if !ids.is_empty() => {
+            let file_id = ids.into_iter().next().unwrap();
+            let title = format!("plot: {}", short_preview(args));
+            vec![InlineQueryResult::CachedPhoto(
+                InlineQueryResultCachedPhoto::new(uuid::Uuid::new_v4().to_string(), file_id)
+                    .title(title)
+                    .description(format!("/plot {}", short_preview(args))),
+            )]
+        }
+        Ok(_) => vec![InlineQueryResult::Article(InlineQueryResultArticle::new(
+            uuid::Uuid::new_v4().to_string(),
+            "пусто",
+            InputMessageContent::Text(InputMessageContentText::new("пусто".to_string())),
+        ))],
+        Err(e) => {
+            let text = e.to_string();
+            let trimmed: String = if text.chars().count() > 200 {
+                let mut s: String = text.chars().take(200).collect();
+                s.push('…');
+                s
+            } else {
+                text
+            };
+            vec![InlineQueryResult::Article(
+                InlineQueryResultArticle::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    format!("\u{26A0}\u{FE0F} {trimmed}"),
+                    InputMessageContent::Text(InputMessageContentText::new(trimmed.clone())),
+                )
+                .description(trimmed),
+            )]
+        }
     }
 }
 
@@ -3028,23 +3091,18 @@ async fn stash_upload(bot: &Bot, stash_chat: ChatId, bytes: Vec<u8>) -> anyhow::
     Ok(file_id)
 }
 
-/// Resolve `(source, dialect)` to one Telegram `file_id` per rendered
-/// page, using `render_cache` as a memoizing store and the admin's DM as
-/// the upload stash. Errors surface compile failures, missing admin
-/// config, and upload problems separately so callers can present them
-/// usefully.
-async fn render_to_file_ids(
+/// Compile a typst `doc` to pages, upload each to the stash, and cache
+/// the resulting `file_id`s under `cache_key`. Repeat calls with the same
+/// key are a single SQLite read. Shared between math and plot renders;
+/// callers build their own document + cache key for namespace separation.
+async fn doc_to_file_ids(
     bot: &Bot,
     config: &BotConfig,
-    source: &str,
-    dialect: crate::math::Dialect,
+    cache_key: &str,
+    doc: &str,
 ) -> anyhow::Result<Vec<FileId>> {
-    let opts = typst_opts_from_env();
-    let doc = crate::math::assemble(source, dialect, &opts);
-    let key = render_cache_key(dialect, &doc, &opts);
-
-    if let Ok(Some(ids)) = config.db.render_cache_get(&key).await {
-        log::debug!("render cache hit: {key}");
+    if let Ok(Some(ids)) = config.db.render_cache_get(cache_key).await {
+        log::debug!("render cache hit: {cache_key}");
         return Ok(ids.into_iter().map(FileId).collect());
     }
 
@@ -3053,7 +3111,8 @@ async fn render_to_file_ids(
         .ok_or_else(|| anyhow::anyhow!("инлайн-картинки требуют настроенного админа"))?;
     let stash_chat = ChatId(admin.0 as i64);
 
-    let pages = crate::typst::compile_doc(&doc, &opts)
+    let opts = typst_opts_from_env();
+    let pages = crate::typst::compile_doc(doc, &opts)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -3064,11 +3123,51 @@ async fn render_to_file_ids(
     }
 
     let raw_strings: Vec<String> = ids.iter().map(|f| f.0.clone()).collect();
-    if let Err(e) = config.db.render_cache_put(&key, &raw_strings).await {
-        log::warn!("render_cache_put({key}): {e}");
+    if let Err(e) = config.db.render_cache_put(cache_key, &raw_strings).await {
+        log::warn!("render_cache_put({cache_key}): {e}");
     }
 
     Ok(ids)
+}
+
+/// Resolve `(source, dialect)` to file_ids via the shared cache+stash.
+async fn render_to_file_ids(
+    bot: &Bot,
+    config: &BotConfig,
+    source: &str,
+    dialect: crate::math::Dialect,
+) -> anyhow::Result<Vec<FileId>> {
+    let opts = typst_opts_from_env();
+    let doc = crate::math::assemble(source, dialect, &opts);
+    let key = render_cache_key(dialect, &doc, &opts);
+    doc_to_file_ids(bot, config, &key, &doc).await
+}
+
+/// Resolve a plot-args string to file_ids via the shared cache+stash.
+async fn plot_to_file_ids(
+    bot: &Bot,
+    config: &BotConfig,
+    args: &str,
+) -> anyhow::Result<Vec<FileId>> {
+    let req = crate::plot::parse_args(args).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let doc = crate::plot::assemble(&req);
+    let opts = typst_opts_from_env();
+    let key = plot_cache_key(&doc, &opts);
+    doc_to_file_ids(bot, config, &key, &doc).await
+}
+
+fn plot_cache_key(doc: &str, opts: &crate::typst::RenderOpts) -> String {
+    use sha2::{Digest, Sha256};
+    const SCHEMA: u32 = 1;
+    let mut h = Sha256::new();
+    h.update(b"mallard-plot");
+    h.update(SCHEMA.to_le_bytes());
+    h.update(b"|");
+    h.update(opts.ppi.to_le_bytes());
+    h.update(opts.text_size_pt.to_le_bytes());
+    h.update(b"|");
+    h.update(doc.as_bytes());
+    hex::encode(h.finalize())
 }
 
 /// Single page → `send_photo`. Two-to-ten pages → `send_media_group`
@@ -3150,6 +3249,49 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+// ---------- /plot — function plots via typst + cetz-plot ----------
+
+async fn handle_plot(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "util.plot").await {
+        return Ok(());
+    }
+    let args = rest.trim();
+    if args.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "примеры:\n\
+             /plot sin(x), 0, 2*pi\n\
+             /plot sin(x), cos(x), -pi, pi\n\
+             /plot exp(-x^2), -3, 3",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let render_opts = typst_opts_from_env();
+    match crate::plot::render_args(args, &render_opts).await {
+        Ok(pages) => {
+            send_typst_pages(bot, msg, pages).await?;
+        }
+        Err(e) => {
+            let text = e.to_string();
+            bot.send_message(
+                msg.chat.id,
+                format!("\u{26A0}\u{FE0F} {}", truncate_chars(&text, 600)),
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 // ---------- /sym — symbolica CAS ----------
