@@ -84,7 +84,10 @@ spec:
               memory: "128Mi"
             limits:
               cpu: "1500m"
-              memory: "1Gi"
+              # 2.5 Gi accommodates the nix-catalog refresh peak: 80 MB of
+              # decompressed JSON parsed into Value-heavy structs, plus FTS5
+              # bulk-insert overhead. Steady-state RSS is ~150 MB.
+              memory: "2500Mi"
       volumes:
         - name: voices
           persistentVolumeClaim:
