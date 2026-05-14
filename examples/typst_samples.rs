@@ -1,7 +1,8 @@
 //! Render a few sample inputs to PNG for manual inspection.
 //! `nix-shell -p typst --run 'cargo run --example typst_samples'`
 
-use mallard_bot::typst::{render, RenderOpts};
+use mallard_bot::math::{render, Dialect};
+use mallard_bot::typst::RenderOpts;
 
 #[tokio::main]
 async fn main() {
@@ -28,7 +29,7 @@ async fn main() {
 
     let opts = RenderOpts::default();
     for (name, src) in cases {
-        match render(src, &opts).await {
+        match render(src, Dialect::Typst, &opts).await {
             Ok(pages) => {
                 for (i, bytes) in pages.iter().enumerate() {
                     let suffix = if pages.len() == 1 {

@@ -1,14 +1,13 @@
-//! Render Typst snippets to PNG via the `typst` CLI.
+//! Low-level Typst compile pipeline.
 //!
-//! For chat ergonomics: if the source contains no `#` or `$`, the whole
-//! input is wrapped as `$ ... $` so `/typst x^2 + 1` Just Works as math.
-//! Otherwise the source is rendered as a full document. A small preamble
-//! (auto-sized page, larger text) is prepended either way.
+//! [`compile_doc`] takes an already-assembled Typst document and runs it
+//! through the `typst` CLI, returning one PNG per page. Higher-level
+//! dialect handling (auto-wrapping bare math, mitex for LaTeX) lives in
+//! [`crate::math`] — this module shouldn't know about dialects.
 //!
-//! Multi-page output is returned page-by-page; callers decide whether to
-//! send a single photo or an album. A process-wide semaphore caps how many
-//! `typst` subprocesses can run concurrently — typst is CPU- and
-//! memory-heavy and the bot has neighbours on the same node.
+//! A process-wide semaphore caps how many `typst` subprocesses can run
+//! concurrently — typst is CPU- and memory-heavy and the bot has
+//! neighbours on the same node.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -122,31 +121,14 @@ fn render_semaphore() -> &'static Semaphore {
     SEM.get_or_init(|| Semaphore::new(2))
 }
 
-/// Build the actual `.typ` document fed to the compiler. Pure function —
-/// no I/O, safe to unit-test.
-pub fn assemble(src: &str, opts: &RenderOpts) -> String {
-    let trimmed = src.trim();
-    let looks_like_doc = trimmed.contains('#') || trimmed.contains('$');
-    let body = if looks_like_doc {
-        trimmed.to_string()
-    } else {
-        format!("$ {trimmed} $")
-    };
-    format!(
-        "#set page(width: auto, height: auto, margin: (x: 10pt, y: 8pt))\n\
-         #set text(size: {size}pt)\n\
-         {body}\n",
-        size = opts.text_size_pt,
-        body = body,
-    )
-}
-
-/// Compile `source` and return one PNG byte-vector per page. Caller chooses
-/// `send_photo` vs `send_media_group` based on `.len()`.
-pub async fn render(source: &str, opts: &RenderOpts) -> Result<Vec<Vec<u8>>, RenderError> {
-    if source.len() > opts.max_input_bytes {
+/// Compile an already-assembled Typst document and return one PNG per
+/// page. Caller decides `send_photo` vs `send_media_group` based on
+/// `.len()`. Dialect wrapping (math auto-`$`, mitex, etc.) lives in
+/// [`crate::math`].
+pub async fn compile_doc(doc: &str, opts: &RenderOpts) -> Result<Vec<Vec<u8>>, RenderError> {
+    if doc.len() > opts.max_input_bytes {
         return Err(RenderError::TooLong {
-            len: source.len(),
+            len: doc.len(),
             max: opts.max_input_bytes,
         });
     }
@@ -156,14 +138,13 @@ pub async fn render(source: &str, opts: &RenderOpts) -> Result<Vec<Vec<u8>>, Ren
         .await
         .expect("render semaphore poisoned");
 
-    let doc = assemble(source, opts);
     let dir = TempDir::new().map_err(RenderError::Io)?;
     let input_path = dir.path().join("input.typ");
     // `{p}` is typst's page-number placeholder. With it, single-page and
     // multi-page output share one code path (always `output-1.png` for
     // page 1, `output-2.png` for page 2, …).
     let output_pattern = dir.path().join("output-{p}.png");
-    tokio::fs::write(&input_path, &doc)
+    tokio::fs::write(&input_path, doc)
         .await
         .map_err(RenderError::Io)?;
 
@@ -268,25 +249,14 @@ fn process_page(bytes: Vec<u8>, opts: &RenderOpts) -> Result<Vec<u8>, RenderErro
 mod tests {
     use super::*;
 
-    #[test]
-    fn assemble_wraps_bare_math() {
-        let out = assemble("x^2 + 1", &RenderOpts::default());
-        assert!(out.contains("$ x^2 + 1 $"), "got: {out}");
-    }
-
-    #[test]
-    fn assemble_leaves_document_alone() {
-        let src = "#set page(width: 5cm)\nhello";
-        let out = assemble(src, &RenderOpts::default());
-        assert!(out.contains("#set page(width: 5cm)"));
-        assert!(!out.contains("$ #set"));
-    }
-
-    #[test]
-    fn assemble_leaves_explicit_math_alone() {
-        let src = "result is $ x^2 $";
-        let out = assemble(src, &RenderOpts::default());
-        assert!(out.ends_with("result is $ x^2 $\n"), "got: {out}");
+    fn doc(src: &str) -> String {
+        // Minimal test document — no math wrap, no preamble dependency
+        // on the higher-level math module.
+        format!(
+            "#set page(width: auto, height: auto, margin: 8pt)\n\
+             #set text(size: 16pt)\n\
+             {src}\n"
+        )
     }
 
     async fn typst_on_path() -> bool {
@@ -304,7 +274,7 @@ mod tests {
             eprintln!("skipping render test — typst not on PATH");
             return;
         }
-        let pages = render("x^2 + 1", &RenderOpts::default())
+        let pages = compile_doc(&doc("$ x^2 + 1 $"), &RenderOpts::default())
             .await
             .expect("render");
         assert_eq!(pages.len(), 1);
@@ -318,7 +288,9 @@ mod tests {
             return;
         }
         let src = "page one\n#pagebreak()\npage two\n#pagebreak()\npage three";
-        let pages = render(src, &RenderOpts::default()).await.expect("render");
+        let pages = compile_doc(&doc(src), &RenderOpts::default())
+            .await
+            .expect("render");
         assert_eq!(pages.len(), 3);
         for p in &pages {
             assert_eq!(&p[0..8], b"\x89PNG\r\n\x1a\n");
@@ -335,7 +307,7 @@ mod tests {
             max_pages: 2,
             ..Default::default()
         };
-        let err = render(src, &opts).await.expect_err("should fail");
+        let err = compile_doc(&doc(src), &opts).await.expect_err("should fail");
         assert!(matches!(err, RenderError::TooManyPages { .. }));
     }
 
@@ -344,7 +316,7 @@ mod tests {
         if !typst_on_path().await {
             return;
         }
-        let err = render("#bogus_function_name()", &RenderOpts::default())
+        let err = compile_doc(&doc("#bogus_function_name()"), &RenderOpts::default())
             .await
             .expect_err("should fail");
         assert!(matches!(err, RenderError::Compile(_)), "got: {err:?}");
@@ -357,7 +329,7 @@ mod tests {
             max_input_bytes: 16 * 1024,
             ..Default::default()
         };
-        let err = render(&big, &opts).await.expect_err("should reject");
+        let err = compile_doc(&big, &opts).await.expect_err("should reject");
         assert!(matches!(err, RenderError::TooLong { .. }));
     }
 }

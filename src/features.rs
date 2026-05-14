@@ -32,7 +32,11 @@ pub const FEATURES: &[FeatureDef] = &[
     FeatureDef { path: "nix.nchan",     default: false },
     FeatureDef { path: "nix.nflake",    default: false },
     FeatureDef { path: "util.typst",    default: true  },
+    FeatureDef { path: "util.latex",    default: true  },
+    FeatureDef { path: "util.math",     default: true  },
     FeatureDef { path: "ambient.typst.fenced", default: false },
+    FeatureDef { path: "ambient.latex.fenced", default: false },
+    FeatureDef { path: "ambient.math.dollar",  default: false },
 ];
 
 pub fn default_of(flag: &str) -> bool {

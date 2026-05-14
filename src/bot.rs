@@ -76,6 +76,12 @@ pub enum Command {
     Feature(String),
     #[command(description = "отрендерить typst: /typst x^2 + 1 (или в ответ на сообщение)")]
     Typst(String),
+    #[command(description = "отрендерить latex: /latex \\frac{1}{2} (или в ответ на сообщение)")]
+    Latex(String),
+    #[command(hide)]
+    Tex(String),
+    #[command(description = "/math <код> — кряква сама поймёт, typst это или latex")]
+    Math(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -186,6 +192,17 @@ const HELP_TYPST: &str = "/typst — отрендерить typst-сниппет
 Доступны пакеты с @preview/ (например cetz). Лимит компиляции — 15 секунд, ввод до 16 КБ.\n\
 кря-кря.";
 
+const HELP_LATEX: &str = "/latex (и /tex) — отрендерить latex-математику через пакет mitex.\n\
+* /latex \\frac{1}{2}\n\
+* /latex в ответ на сообщение — возьмёт текст ответного сообщения\n\
+Поддерживается основной набор математических команд: \\frac, \\sum, \\int, \\sqrt, \\alpha, \\begin{matrix}…\\end{matrix} и так далее. TikZ, кастомные \\newcommand и полноценные документы — это к /typst.\n\
+кря-кря.";
+
+const HELP_MATH: &str = "/math <код> — кряква сама смотрит на источник и решает, typst это или latex.\n\
+Эвристика простая: если в коде есть \\<буквы> (например \\frac) — это latex, иначе typst.\n\
+Если автоопределение промахнулось, используйте явные /typst или /latex.\n\
+кря-кря.";
+
 const HELP_FEATURE: &str = "/feature — управление флагами команд в этом чате.\n\
 Имена флагов — это пути с точками (`fun.roll`, `nix.npkg`).\n\
 Просмотр:\n\
@@ -234,6 +251,8 @@ fn help_for(query: &str) -> String {
         "nflake" => HELP_NFLAKE.to_string(),
         "feature" => HELP_FEATURE.to_string(),
         "typst" => HELP_TYPST.to_string(),
+        "latex" | "tex" => HELP_LATEX.to_string(),
+        "math" => HELP_MATH.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -326,7 +345,25 @@ async fn handle_text(
     config: BotConfig,
 ) -> anyhow::Result<()> {
     track_membership(&msg, &config).await;
-    ambient_typst_fenced(&bot, &msg, &config).await;
+    ambient_fenced(
+        &bot,
+        &msg,
+        &config,
+        "ambient.typst.fenced",
+        &["typst"],
+        crate::math::Dialect::Typst,
+    )
+    .await;
+    ambient_fenced(
+        &bot,
+        &msg,
+        &config,
+        "ambient.latex.fenced",
+        &["latex", "tex"],
+        crate::math::Dialect::Latex,
+    )
+    .await;
+    ambient_math_dollar(&bot, &msg, &config).await;
     let text = match msg.text().or_else(|| msg.caption()) {
         Some(t) => t.to_string(),
         None => return Ok(()),
@@ -395,6 +432,9 @@ async fn handle_command(
         Command::Nflake(r) => format!("nflake {r}").trim().to_string(),
         Command::Feature(r) => format!("feature {r}").trim().to_string(),
         Command::Typst(r) => format!("typst {r}").trim().to_string(),
+        Command::Latex(r) => format!("latex {r}").trim().to_string(),
+        Command::Tex(r) => format!("tex {r}").trim().to_string(),
+        Command::Math(r) => format!("math {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -427,7 +467,11 @@ async fn handle_command(
         Command::Nchan(rest) => handle_nchan(&bot, &msg, &rest, &config).await,
         Command::Nflake(rest) => handle_nflake(&bot, &msg, &rest, &config).await,
         Command::Feature(rest) => handle_feature(&bot, &msg, &rest, &config).await,
-        Command::Typst(rest) => handle_typst(&bot, &msg, &rest, &config).await,
+        Command::Typst(rest) => handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Typst).await,
+        Command::Latex(rest) | Command::Tex(rest) => {
+            handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Latex).await
+        }
+        Command::Math(rest) => handle_math_cmd(&bot, &msg, &rest, &config, MathRoute::Auto).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -2285,51 +2329,48 @@ async fn cha_gossip(
     Ok(())
 }
 
-// ---------- ambient.typst.fenced — auto-render ```typst blocks ----------
+// ---------- /typst, /latex, /math + ambient detectors ----------
 
-/// Watches non-command messages for a fenced code block tagged `typst`.
-/// When the chat has `ambient.typst.fenced` enabled, the block is rendered
-/// silently — compile errors are logged, never echoed, since the user
-/// didn't explicitly ask. Plain ``` blocks (no language) are ignored on
-/// purpose — too noisy.
-async fn ambient_typst_fenced(bot: &Bot, msg: &Message, config: &BotConfig) {
-    if !is_feature_enabled(config, msg.chat.id, "ambient.typst.fenced").await {
-        return;
-    }
-    let Some(refs) = msg
-        .parse_entities()
-        .or_else(|| msg.parse_caption_entities())
-    else {
-        return;
-    };
-    use teloxide::types::MessageEntityKind;
-    let source = refs.iter().find_map(|e| match e.kind() {
-        MessageEntityKind::Pre {
-            language: Some(lang),
-        } if lang.eq_ignore_ascii_case("typst") => Some(e.text().to_string()),
-        _ => None,
-    });
-    let Some(source) = source else { return };
+#[derive(Clone, Copy)]
+enum MathRoute {
+    Typst, // /typst — always typst
+    Latex, // /latex, /tex — always latex via mitex
+    Auto,  // /math — detect from source
+}
 
-    let opts = typst_opts_from_env();
-    match crate::typst::render(&source, &opts).await {
-        Ok(pages) => {
-            if let Err(e) = send_typst_pages(bot, msg, pages).await {
-                log::warn!("ambient typst send: {e}");
-            }
+impl MathRoute {
+    fn feature_flag(self) -> &'static str {
+        match self {
+            Self::Typst => "util.typst",
+            Self::Latex => "util.latex",
+            Self::Auto => "util.math",
         }
-        Err(e) => {
-            log::info!("ambient typst skipped: {e}");
+    }
+
+    /// Code-block language tags to prefer when extracting source from a
+    /// replied message. Order matters within each route.
+    fn preferred_langs(self) -> &'static [&'static str] {
+        match self {
+            Self::Typst => &["typst"],
+            Self::Latex => &["latex", "tex"],
+            Self::Auto => &["typst", "latex", "tex"],
+        }
+    }
+
+    fn example(self) -> &'static str {
+        match self {
+            Self::Typst => "/typst x^2 + 1",
+            Self::Latex => "/latex \\frac{1}{2}",
+            Self::Auto => "/math \\frac{1}{2}",
         }
     }
 }
 
-// ---------- /typst — render typst snippets to PNG ----------
-
-/// Pull source out of a replied message, preferring fenced code blocks
-/// (Telegram delivers them with the fences already stripped) over plain
-/// text. Order: ```typst → any ``` → inline ` ` → whole text.
-fn extract_typst_source(msg: &Message) -> Option<String> {
+/// Pull source out of a replied message. Preference order: language-tagged
+/// fenced block matching `preferred_langs` → any fenced block → inline
+/// `code` entity → whole message text. Telegram delivers code blocks with
+/// the fences already stripped, so we can use the entity text directly.
+fn extract_source(msg: &Message, preferred_langs: &[&str]) -> Option<String> {
     use teloxide::types::MessageEntityKind;
 
     let entities = msg
@@ -2342,7 +2383,10 @@ fn extract_typst_source(msg: &Message) -> Option<String> {
                 language: Some(lang),
             } = e.kind()
             {
-                if lang.eq_ignore_ascii_case("typst") {
+                if preferred_langs
+                    .iter()
+                    .any(|p| lang.eq_ignore_ascii_case(p))
+                {
                     return Some(e.text().to_string());
                 }
             }
@@ -2362,13 +2406,14 @@ fn extract_typst_source(msg: &Message) -> Option<String> {
     msg.text().or_else(|| msg.caption()).map(|s| s.to_string())
 }
 
-async fn handle_typst(
+async fn handle_math_cmd(
     bot: &Bot,
     msg: &Message,
     rest: &str,
     config: &BotConfig,
+    route: MathRoute,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "util.typst").await {
+    if !is_feature_enabled(config, msg.chat.id, route.feature_flag()).await {
         return Ok(());
     }
 
@@ -2376,12 +2421,12 @@ async fn handle_typst(
     let source: String = if !inline.is_empty() {
         inline.to_string()
     } else if let Some(reply) = msg.reply_to_message() {
-        match extract_typst_source(reply) {
+        match extract_source(reply, route.preferred_langs()) {
             Some(t) => t,
             None => {
                 bot.send_message(
                     msg.chat.id,
-                    "не ква, ответьте на сообщение с typst-кодом или укажите код после команды.",
+                    "не ква, ответьте на сообщение с кодом или напишите код после команды.",
                 )
                 .reply_parameters(reply_params(msg))
                 .await?;
@@ -2391,15 +2436,24 @@ async fn handle_typst(
     } else {
         bot.send_message(
             msg.chat.id,
-            "пример: /typst x^2 + 1\nили ответьте этой командой на сообщение с typst-кодом.",
+            format!(
+                "пример: {}\nили ответьте этой командой на сообщение с кодом.",
+                route.example()
+            ),
         )
         .reply_parameters(reply_params(msg))
         .await?;
         return Ok(());
     };
 
+    let dialect = match route {
+        MathRoute::Typst => crate::math::Dialect::Typst,
+        MathRoute::Latex => crate::math::Dialect::Latex,
+        MathRoute::Auto => crate::math::detect(&source),
+    };
+
     let opts = typst_opts_from_env();
-    match crate::typst::render(&source, &opts).await {
+    match crate::math::render(&source, dialect, &opts).await {
         Ok(pages) => {
             send_typst_pages(bot, msg, pages).await?;
         }
@@ -2418,6 +2472,80 @@ async fn handle_typst(
         }
     }
     Ok(())
+}
+
+// ---------- ambient renderers ----------
+
+/// Shared helper for `ambient.<dialect>.fenced` flags. Looks for a Pre
+/// entity tagged with any of `langs`. Errors are logged, never echoed —
+/// the user didn't explicitly ask for a render.
+async fn ambient_fenced(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    flag: &'static str,
+    langs: &[&str],
+    dialect: crate::math::Dialect,
+) {
+    if !is_feature_enabled(config, msg.chat.id, flag).await {
+        return;
+    }
+    let Some(refs) = msg
+        .parse_entities()
+        .or_else(|| msg.parse_caption_entities())
+    else {
+        return;
+    };
+    use teloxide::types::MessageEntityKind;
+    let source = refs.iter().find_map(|e| match e.kind() {
+        MessageEntityKind::Pre {
+            language: Some(lang),
+        } if langs.iter().any(|l| lang.eq_ignore_ascii_case(l)) => Some(e.text().to_string()),
+        _ => None,
+    });
+    let Some(source) = source else { return };
+
+    let opts = typst_opts_from_env();
+    match crate::math::render(&source, dialect, &opts).await {
+        Ok(pages) => {
+            if let Err(e) = send_typst_pages(bot, msg, pages).await {
+                log::warn!("ambient {flag} send: {e}");
+            }
+        }
+        Err(e) => {
+            log::info!("ambient {flag} skipped: {e}");
+        }
+    }
+}
+
+/// `ambient.math.dollar`: render the first `$$ ... $$` block in the
+/// message. Dialect auto-detected from the content. Plain single `$ $`
+/// is intentionally ignored — too many false positives (prices, code, …).
+async fn ambient_math_dollar(bot: &Bot, msg: &Message, config: &BotConfig) {
+    if !is_feature_enabled(config, msg.chat.id, "ambient.math.dollar").await {
+        return;
+    }
+    let Some(text) = msg.text().or_else(|| msg.caption()) else {
+        return;
+    };
+    let Some(start) = text.find("$$") else { return };
+    let after = &text[start + 2..];
+    let Some(end_rel) = after.find("$$") else { return };
+    let source = after[..end_rel].trim();
+    if source.is_empty() {
+        return;
+    }
+
+    let dialect = crate::math::detect(source);
+    let opts = typst_opts_from_env();
+    match crate::math::render(source, dialect, &opts).await {
+        Ok(pages) => {
+            if let Err(e) = send_typst_pages(bot, msg, pages).await {
+                log::warn!("ambient math.dollar send: {e}");
+            }
+        }
+        Err(e) => log::info!("ambient math.dollar skipped: {e}"),
+    }
 }
 
 /// Build `RenderOpts` with the package cache path pulled from env, falling
