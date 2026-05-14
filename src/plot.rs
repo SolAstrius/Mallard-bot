@@ -122,12 +122,18 @@ pub async fn render_args(input: &str, opts: &RenderOpts) -> Result<Vec<Vec<u8>>,
 
 /// Build the typst document for a parsed request.
 pub fn assemble(req: &PlotRequest) -> String {
+    // 500 samples gives smooth curves across the kind of ranges chat
+    // users actually pick (-10..10 of sin / cos / damped oscillators,
+    // gaussians, sigmoids). Cetz-plot's default of 50 is jagged for
+    // anything past one cycle.
+    const SAMPLES: u32 = 500;
     let mut body = String::new();
     for expr in &req.exprs {
         body.push_str(&format!(
-            "    plot.add(domain: ({lo}, {hi}), x => {expr})\n",
+            "    plot.add(domain: ({lo}, {hi}), samples: {samples}, x => {expr})\n",
             lo = req.lo,
             hi = req.hi,
+            samples = SAMPLES,
             expr = expr,
         ));
     }
