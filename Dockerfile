@@ -21,11 +21,20 @@ RUN cargo build --release --locked
 # ---- runtime ------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
+ARG TYPST_VERSION=0.14.2
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL -o /tmp/typst.tar.xz \
+        "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz" \
+    && tar -xJf /tmp/typst.tar.xz -C /tmp \
+    && mv /tmp/typst-x86_64-unknown-linux-musl/typst /usr/local/bin/typst \
+    && rm -rf /tmp/typst.tar.xz /tmp/typst-x86_64-unknown-linux-musl
 
 WORKDIR /app
 COPY --from=builder /build/target/release/mallard-bot /usr/local/bin/mallard-bot
@@ -35,4 +44,5 @@ COPY content ./content
 COPY voices ./default-voices
 
 ENV RUST_LOG=info
+ENV TYPST_PACKAGE_CACHE_PATH=/app/data/typst-cache
 CMD ["mallard-bot"]

@@ -31,6 +31,7 @@ pub const FEATURES: &[FeatureDef] = &[
     FeatureDef { path: "nix.nixwhere",  default: false },
     FeatureDef { path: "nix.nchan",     default: false },
     FeatureDef { path: "nix.nflake",    default: false },
+    FeatureDef { path: "util.typst",    default: true  },
 ];
 
 pub fn default_of(flag: &str) -> bool {

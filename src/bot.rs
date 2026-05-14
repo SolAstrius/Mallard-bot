@@ -74,6 +74,8 @@ pub enum Command {
     Nflake(String),
     #[command(description = "флаги в чате: /feature, /feature <шаблон> on|off|reset (для админов)")]
     Feature(String),
+    #[command(description = "отрендерить typst: /typst x^2 + 1 (или в ответ на сообщение)")]
+    Typst(String),
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -176,6 +178,14 @@ const HELP_NFLAKE: &str = "/nflake <имя> — разрешает имя чер
 Например: /nflake nixpkgs, /nflake home-manager\n\
 кря-кря.";
 
+const HELP_TYPST: &str = "/typst — отрендерить typst-сниппет в PNG.\n\
+Два способа задать источник:\n\
+* /typst <код> — например /typst x^2 + 1\n\
+* /typst в ответ на сообщение — возьмёт текст ответного сообщения как код\n\
+Если в коде нет ни # ни $, он оборачивается в `$ ... $`, то есть односложные формулы пишутся без лишних символов.\n\
+Доступны пакеты с @preview/ (например cetz). Лимит компиляции — 15 секунд, ввод до 16 КБ.\n\
+кря-кря.";
+
 const HELP_FEATURE: &str = "/feature — управление флагами команд в этом чате.\n\
 Имена флагов — это пути с точками (`fun.roll`, `nix.npkg`).\n\
 Просмотр:\n\
@@ -223,6 +233,7 @@ fn help_for(query: &str) -> String {
         "nchan" => HELP_NCHAN.to_string(),
         "nflake" => HELP_NFLAKE.to_string(),
         "feature" => HELP_FEATURE.to_string(),
+        "typst" => HELP_TYPST.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -382,6 +393,7 @@ async fn handle_command(
         Command::Nchan(r) => format!("nchan {r}").trim().to_string(),
         Command::Nflake(r) => format!("nflake {r}").trim().to_string(),
         Command::Feature(r) => format!("feature {r}").trim().to_string(),
+        Command::Typst(r) => format!("typst {r}").trim().to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -414,6 +426,7 @@ async fn handle_command(
         Command::Nchan(rest) => handle_nchan(&bot, &msg, &rest, &config).await,
         Command::Nflake(rest) => handle_nflake(&bot, &msg, &rest, &config).await,
         Command::Feature(rest) => handle_feature(&bot, &msg, &rest, &config).await,
+        Command::Typst(rest) => handle_typst(&bot, &msg, &rest, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -2268,5 +2281,71 @@ async fn cha_gossip(
     bot.send_message(msg.chat.id, body)
         .reply_parameters(reply_params(msg))
         .await?;
+    Ok(())
+}
+
+// ---------- /typst — render typst snippets to PNG ----------
+
+async fn handle_typst(
+    bot: &Bot,
+    msg: &Message,
+    rest: &str,
+    config: &BotConfig,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, "util.typst").await {
+        return Ok(());
+    }
+
+    let inline = rest.trim();
+    let source: String = if !inline.is_empty() {
+        inline.to_string()
+    } else if let Some(reply) = msg.reply_to_message() {
+        match reply.text().or_else(|| reply.caption()) {
+            Some(t) => t.to_string(),
+            None => {
+                bot.send_message(
+                    msg.chat.id,
+                    "не ква, ответьте на сообщение с typst-кодом или укажите код после команды.",
+                )
+                .reply_parameters(reply_params(msg))
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        bot.send_message(
+            msg.chat.id,
+            "пример: /typst x^2 + 1\nили ответьте этой командой на сообщение с typst-кодом.",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    };
+
+    let mut opts = crate::typst::RenderOpts::default();
+    if let Ok(path) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
+        opts.package_cache_path = Some(std::path::PathBuf::from(path));
+    }
+
+    match crate::typst::render_png(&source, &opts).await {
+        Ok(bytes) => {
+            bot.send_photo(msg.chat.id, InputFile::memory(bytes).file_name("typst.png"))
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let trimmed: String = if text.chars().count() > 800 {
+                let mut s: String = text.chars().take(800).collect();
+                s.push('…');
+                s
+            } else {
+                text
+            };
+            bot.send_message(msg.chat.id, format!("\u{26A0}\u{FE0F} {trimmed}"))
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+    }
     Ok(())
 }
