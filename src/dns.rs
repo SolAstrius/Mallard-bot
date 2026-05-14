@@ -816,22 +816,65 @@ async fn cmd_dmarc(tokens: &[&str], rules: &[(String, String)]) -> String {
         .unwrap_or(&UPSTREAMS[0]);
     let name = format!("_dmarc.{}", domain);
     let q = query_at(pick.ips[0], &name, RecordType::TXT, timeout).await;
-    let Some(dmarc) = q
+
+    let candidates: Vec<String> = q
         .rows
-        .into_iter()
-        .map(|r| r.value)
-        .find(|v| v.to_ascii_lowercase().starts_with("v=dmarc1"))
-    else {
-        return format!("; {} — DMARC не найден (или не TXT)\n", name);
-    };
-    let mut out = format!("; DMARC {}\n{}\n\n", domain, dmarc);
+        .iter()
+        .map(|r| r.value.clone())
+        .filter(|v| v.to_ascii_lowercase().starts_with("v=dmarc1"))
+        .collect();
+    if candidates.is_empty() {
+        let mut out = format!("; {} — DMARC не найден\n", name);
+        if let Some(err) = &q.error {
+            out.push_str(&format!("; {err}\n"));
+        }
+        return out;
+    }
+    if candidates.len() > 1 {
+        // RFC 7489 §6.6.3: multiple v=DMARC1 records → policy is ignored
+        // by receivers. Worth flagging.
+        let mut out = format!(
+            "; ⚠️ {} — найдено {} DMARC-записей. По RFC 7489 §6.6.3 политика игнорируется.\n",
+            name,
+            candidates.len()
+        );
+        for (i, v) in candidates.iter().enumerate() {
+            out.push_str(&format!("  [{i}] {v}\n"));
+        }
+        return out;
+    }
+    let dmarc = &candidates[0];
+
+    // Parse tag→value first so we can synthesize a headline.
+    let mut tags: Vec<(String, String)> = Vec::new();
     for part in dmarc.split(';') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
         let (tag, val) = part.split_once('=').unwrap_or((part, ""));
-        let explanation = explain_dmarc_tag(tag.trim(), val.trim());
+        tags.push((tag.trim().to_string(), val.trim().to_string()));
+    }
+    let p = tags
+        .iter()
+        .find(|(k, _)| k == "p")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("none");
+    let pct = tags
+        .iter()
+        .find(|(k, _)| k == "pct")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("100");
+    let headline = match p {
+        "reject" => format!("✅ p=reject (отказ при провале), pct={pct}"),
+        "quarantine" => format!("⚠️ p=quarantine (в спам при провале), pct={pct}"),
+        "none" => "ℹ️ p=none — DMARC только мониторит, реальной защиты нет".to_string(),
+        other => format!("? p={other}"),
+    };
+
+    let mut out = format!("; DMARC {}\n; {headline}\n\n{}\n\n", domain, dmarc);
+    for (tag, val) in &tags {
+        let explanation = explain_dmarc_tag(tag, val);
         out.push_str(&format!("  {tag}={val}  — {explanation}\n"));
     }
     out
@@ -1074,58 +1117,107 @@ async fn cmd_mta(tokens: &[&str], rules: &[(String, String)]) -> String {
         .first()
         .copied()
         .unwrap_or(&UPSTREAMS[0]);
+    let upstream_ip = pick.ips[0];
 
-    // _mta-sts.<domain> TXT first — gives the policy ID.
-    let id_q = query_at(
-        pick.ips[0],
-        &format!("_mta-sts.{}", domain),
-        RecordType::TXT,
-        timeout,
-    )
-    .await;
+    // Three things fan out in parallel: the _mta-sts TXT (policy ID),
+    // the policy file fetched over HTTPS, and the _smtp._tls TXT
+    // (TLS-RPT reporting endpoint).
+    let id_name = format!("_mta-sts.{}", domain);
+    let rpt_name = format!("_smtp._tls.{}", domain);
+    let url = format!("https://mta-sts.{}/.well-known/mta-sts.txt", domain);
+    let id_fut = query_at(upstream_ip, &id_name, RecordType::TXT, timeout);
+    let rpt_fut = query_at(upstream_ip, &rpt_name, RecordType::TXT, timeout);
+    let policy_fut = fetch_mta_sts_policy(&url, timeout);
+    let (id_q, rpt_q, policy_res) = futures::join!(id_fut, rpt_fut, policy_fut);
+
     let mut out = format!("; MTA-STS {}\n", domain);
     match id_q.rows.first() {
         Some(r) => out.push_str(&format!("; _mta-sts TXT: {}\n", r.value)),
-        None => out.push_str("; _mta-sts TXT: нет — MTA-STS, скорее всего, не включен\n"),
+        None => out.push_str("; _mta-sts TXT: нет — MTA-STS не включен\n"),
+    }
+    out.push('\n');
+
+    match policy_res {
+        Err(e) => out.push_str(&format!("❌ policy fetch: {e}\n")),
+        Ok((status, body)) => {
+            let parsed = parse_mta_sts_policy(&body);
+            out.push_str(&format!("✅ {status}, {} байт политики\n", body.len()));
+            // Headline: extract version + mode for the eye.
+            let version = parsed.iter().find(|(k, _)| k == "version").map(|(_, v)| v.as_str()).unwrap_or("?");
+            let mode = parsed.iter().find(|(k, _)| k == "mode").map(|(_, v)| v.as_str()).unwrap_or("?");
+            let mode_badge = match mode {
+                "enforce" => "✅",
+                "testing" => "⚠️",
+                "none" => "ℹ️",
+                _ => "?",
+            };
+            out.push_str(&format!("  version: {version}\n"));
+            out.push_str(&format!("  mode:    {mode_badge} {mode}\n"));
+            if version != "STSv1" {
+                out.push_str(&format!("  ⚠️ неизвестная версия (RFC 8461 ждёт STSv1)\n"));
+            }
+            for (k, v) in &parsed {
+                if k == "version" || k == "mode" {
+                    continue;
+                }
+                out.push_str(&format!("  {k}: {v}\n"));
+            }
+        }
     }
 
-    // Fetch the policy file over HTTPS.
-    let url = format!("https://mta-sts.{}/.well-known/mta-sts.txt", domain);
+    // TLS-RPT
+    out.push_str("\n; TLS-RPT\n");
+    let tlsrpt = rpt_q
+        .rows
+        .iter()
+        .map(|r| r.value.clone())
+        .find(|v| v.to_ascii_lowercase().starts_with("v=tlsrptv1"));
+    match tlsrpt {
+        Some(v) => out.push_str(&format!("  ✅ {v}\n")),
+        None => out.push_str("  · нет v=TLSRPTv1\n"),
+    }
+    out
+}
+
+async fn fetch_mta_sts_policy(url: &str, timeout: Duration) -> Result<(u16, String), String> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent("mallard-bot")
         .build()
-        .map_err(|e| e.to_string());
-    match client {
-        Err(e) => out.push_str(&format!("❌ http client: {e}\n")),
-        Ok(c) => match c.get(&url).send().await {
-            Err(e) => out.push_str(&format!("❌ fetch {url}: {e}\n")),
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    out.push_str(&format!("❌ {status}\n"));
-                } else {
-                    out.push_str(&format!("✅ {status} — {} байт\n\n", body.len()));
-                    out.push_str(body.trim());
-                    out.push('\n');
-                }
-            }
-        },
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
     }
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    Ok((status, body))
+}
 
-    // TLS-RPT
-    let rpt_q = query_at(
-        pick.ips[0],
-        &format!("_smtp._tls.{}", domain),
-        RecordType::TXT,
-        timeout,
-    )
-    .await;
-    out.push_str("\n; TLS-RPT\n");
-    match rpt_q.rows.first() {
-        Some(r) => out.push_str(&format!("  {}\n", r.value)),
-        None => out.push_str("  нет _smtp._tls TXT\n"),
+/// Parse an RFC 8461 MTA-STS policy file (one `key: value` per line,
+/// `mx:` lines may repeat). Returns a list of (k, v) preserving order;
+/// `mx` lines are collapsed into a single comma-joined entry.
+fn parse_mta_sts_policy(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut mxes: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        let k = k.trim().to_lowercase();
+        let v = v.trim().to_string();
+        if k == "mx" {
+            mxes.push(v);
+        } else {
+            out.push((k, v));
+        }
+    }
+    if !mxes.is_empty() {
+        out.push(("mx".to_string(), mxes.join(", ")));
     }
     out
 }
@@ -1140,25 +1232,55 @@ async fn cmd_caa(tokens: &[&str], rules: &[(String, String)]) -> String {
         .first()
         .copied()
         .unwrap_or(&UPSTREAMS[0]);
-    let mut out = format!("; CAA-обход {}\n", name);
+    let upstream_ip = pick.ips[0];
+
+    // Probe every suffix in parallel. CAA inherits from parents, so the
+    // first non-empty answer walking from the name toward the apex wins.
     let labels: Vec<&str> = name.trim_end_matches('.').split('.').collect();
-    let mut found = false;
-    for i in 0..labels.len() {
-        let probe = labels[i..].join(".");
-        let q = query_at(pick.ips[0], &probe, RecordType::CAA, timeout).await;
-        if !q.rows.is_empty() {
-            out.push_str(&format!("✅ {} — {} записей\n", probe, q.rows.len()));
-            for r in &q.rows {
-                out.push_str(&format!("   {}\n", r.value));
-            }
-            found = true;
-            break;
-        } else {
-            out.push_str(&format!("·  {} — нет CAA\n", probe));
+    let probes: Vec<String> = (0..labels.len())
+        .map(|i| labels[i..].join("."))
+        .collect();
+    let futs = probes.iter().map(|p| {
+        let p = p.clone();
+        async move {
+            let q = query_at(upstream_ip, &p, RecordType::CAA, timeout).await;
+            (p, q)
         }
+    });
+    let results = futures::future::join_all(futs).await;
+
+    let mut out = format!("; CAA-обход {}\n", name);
+    let mut effective: Option<&(String, QueryResult)> = None;
+    for r in &results {
+        if effective.is_none() && r.1.error.is_none() && !r.1.rows.is_empty() {
+            effective = Some(r);
+        }
+        let badge = if r.1.error.is_some() {
+            "❌"
+        } else if r.1.rows.is_empty() {
+            "·"
+        } else {
+            "✅"
+        };
+        out.push_str(&format!(
+            "{badge} {} — {}\n",
+            r.0,
+            if let Some(err) = &r.1.error {
+                err.clone()
+            } else if r.1.rows.is_empty() {
+                "нет CAA".to_string()
+            } else {
+                format!("{} записей", r.1.rows.len())
+            }
+        ));
     }
-    if !found {
-        out.push_str("; CAA не найден до апекса — любой CA может выпускать сертификаты\n");
+    if let Some((winner, q)) = effective {
+        out.push_str(&format!("\n; действует CAA с {}\n", winner));
+        for r in &q.rows {
+            out.push_str(&format!("   {}\n", r.value));
+        }
+    } else {
+        out.push_str("\n; CAA не найден до апекса — любой CA может выпускать сертификаты\n");
     }
     out
 }
