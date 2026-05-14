@@ -2642,34 +2642,53 @@ async fn handle_feature(
     }
 
     // Recompute effective state across leaves touched by the patterns we
-    // applied, so the user sees the resolved value.
+    // applied. For exact-path writes the user wants to see "after" for the
+    // one leaf; for wildcard / recursive writes a full per-leaf dump would
+    // be a wall of text, so we summarize.
     let rules = config
         .db
         .feature_rules_for_chat(chat.0)
         .await
         .unwrap_or_default();
-    let mut effective: Vec<String> = Vec::new();
+
+    let mut exact_after: Vec<String> = Vec::new();
+    let mut wildcard_summaries: Vec<String> = Vec::new();
     for p in &patterns {
-        for leaf in features::leaves_matching(p) {
-            let (v, _) = features::resolve(&rules, leaf.path);
-            effective.push(format!(
-                "  {} {} = {}",
-                features::pretty_value(leaf, &v),
-                leaf.path,
-                v
-            ));
+        let leaves = features::leaves_matching(p);
+        if leaves.is_empty() {
+            continue;
+        }
+        match p {
+            FeaturePattern::Exact(_) => {
+                for leaf in &leaves {
+                    let (v, _) = features::resolve(&rules, leaf.path);
+                    exact_after.push(format!("  {}", features::format_leaf(leaf, &v)));
+                }
+            }
+            FeaturePattern::Wildcard(_) | FeaturePattern::Recursive(_) => {
+                wildcard_summaries.push(format!(
+                    "  {} — затронуто {} флагов (см. /feature {})",
+                    p.display(),
+                    leaves.len(),
+                    p.display().trim_end_matches(".**").trim_end_matches(".*"),
+                ));
+            }
         }
     }
-    effective.sort();
-    effective.dedup();
+    exact_after.sort();
+    exact_after.dedup();
 
     let mut lines: Vec<String> = Vec::new();
     if !applied.is_empty() {
         lines.push(format!("{}: {}", intent.verb(), applied.join(", ")));
     }
-    if !effective.is_empty() {
+    if !exact_after.is_empty() {
         lines.push("сейчас:".to_string());
-        lines.extend(effective);
+        lines.extend(exact_after);
+    }
+    if !wildcard_summaries.is_empty() {
+        lines.push("сводка:".to_string());
+        lines.extend(wildcard_summaries);
     }
     if !bad.is_empty() {
         lines.push(format!("пропущено: {}", bad.join("; ")));
@@ -2721,12 +2740,7 @@ fn render_feature_overview(chat_id: i64, rules: &[(String, String)]) -> String {
             let src = by
                 .map(|r| format!("← {r}"))
                 .unwrap_or_else(|| "← по умолчанию".to_string());
-            lines.push(format!(
-                "    {} {} = {} {src}",
-                features::pretty_value(f, &v),
-                f.path,
-                v
-            ));
+            lines.push(format!("    {} {src}", features::format_leaf(f, &v)));
         }
     }
 
@@ -2755,12 +2769,7 @@ fn render_feature_subtree(rules: &[(String, String)], pat: &FeaturePattern) -> S
         let src = by
             .map(|r| format!("← {r}"))
             .unwrap_or_else(|| "← по умолчанию".to_string());
-        lines.push(format!(
-            "  {} {} = {} {src}",
-            features::pretty_value(leaf, &v),
-            leaf.path,
-            v
-        ));
+        lines.push(format!("  {} {src}", features::format_leaf(leaf, &v)));
     }
     lines.join("\n")
 }

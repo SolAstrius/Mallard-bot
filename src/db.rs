@@ -42,6 +42,13 @@ fn migrate_chat_features_to_typed(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    // The legacy `enabled INTEGER NOT NULL` column has no default, so any
+    // INSERT that omits it (which is what new code does) fails the NOT NULL
+    // constraint. SQLite 3.35+ supports DROP COLUMN — use it to retire the
+    // legacy column outright now that `value` is authoritative.
+    if has_enabled {
+        conn.execute("ALTER TABLE chat_features DROP COLUMN enabled", [])?;
+    }
     Ok(())
 }
 

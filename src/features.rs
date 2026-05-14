@@ -399,17 +399,28 @@ pub fn leaves_matching(pat: &Pattern) -> Vec<&'static FeatureDef> {
         .collect()
 }
 
-/// Render a stored value with a hint of its type — for the overview UI.
-/// `value` may be either the raw stored string (when there's an explicit
-/// rule) or the resolved default.
-pub fn pretty_value(def: &FeatureDef, value: &str) -> String {
+/// Status glyph for a stored value. Bool flags render as ✅/❌; non-bool
+/// flags (enum/int) get a neutral bullet so the path + value can speak
+/// for themselves without doubling up.
+pub fn status_glyph(def: &FeatureDef, value: &str) -> &'static str {
     match def.ty {
         TypeSpec::Bool => match parse_bool(value) {
-            Some(true) => "\u{2705}".to_string(),
-            Some(false) => "\u{274C}".to_string(),
-            None => format!("?{value}"),
+            Some(true) => "\u{2705}",
+            Some(false) => "\u{274C}",
+            None => "\u{2753}",
         },
-        TypeSpec::Int { .. } | TypeSpec::Enum(_) => value.to_string(),
+        TypeSpec::Int { .. } | TypeSpec::Enum(_) => "\u{2022}",
+    }
+}
+
+/// One-shot formatter for a leaf in a listing: "<glyph> <path> = <value>"
+/// for non-bool types; "<glyph> <path>" for bools (the glyph already
+/// encodes the value).
+pub fn format_leaf(def: &FeatureDef, value: &str) -> String {
+    let g = status_glyph(def, value);
+    match def.ty {
+        TypeSpec::Bool => format!("{g} {}", def.path),
+        _ => format!("{g} {} = {value}", def.path),
     }
 }
 
