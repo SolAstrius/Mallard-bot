@@ -4,6 +4,7 @@ pub mod content;
 pub mod db;
 pub mod dictionaries;
 pub mod exceptions;
+pub mod features;
 pub mod imaging;
 pub mod mallard;
 pub mod nixsearch;

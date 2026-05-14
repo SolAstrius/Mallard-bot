@@ -72,7 +72,7 @@ pub enum Command {
     Nchan(String),
     #[command(description = "flake registry: /nflake nixpkgs")]
     Nflake(String),
-    #[command(description = "флаги в чате: /feature, /feature a,b,c on|off|reset (для админов)")]
+    #[command(description = "флаги в чате: /feature, /feature <шаблон> on|off|reset (для админов)")]
     Feature(String),
 }
 
@@ -176,6 +176,19 @@ const HELP_NFLAKE: &str = "/nflake <имя> — разрешает имя чер
 Например: /nflake nixpkgs, /nflake home-manager\n\
 кря-кря.";
 
+const HELP_FEATURE: &str = "/feature — управление флагами команд в этом чате.\n\
+Имена флагов — это пути с точками (`fun.roll`, `nix.npkg`).\n\
+Просмотр:\n\
+* /feature — все флаги и активные правила.\n\
+* /feature nix — состояние всего поддерева nix.\n\
+Изменение (только для админов чата):\n\
+* /feature nix.* on — включить всё под nix.\n\
+* /feature nix.npkg off — выключить конкретный флаг.\n\
+* /feature fun.roll, nix.* reset — снять правила с перечисленных шаблонов.\n\
+* /feature util.** reset — рекурсивно удалить все правила под util.*.\n\
+Правило с более длинным буквенным префиксом побеждает: /feature nix.* on плюс /feature nix.npkg off оставляет npkg выключенным, а остальное nix-* включённым.\n\
+кря-кря.";
+
 const HELP_CHA: &str = "/cha — чайная сессия.\n\
 Кряква считает заварки и помнит, кто сейчас пьёт чай.\n\
 * /cha <название> — начать сессию (название — свободный текст)\n\
@@ -209,6 +222,7 @@ fn help_for(query: &str) -> String {
         "nixwhere" => HELP_NIXWHERE.to_string(),
         "nchan" => HELP_NCHAN.to_string(),
         "nflake" => HELP_NFLAKE.to_string(),
+        "feature" => HELP_FEATURE.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
              Кряква умеет: /snap, /qva, /emoji, /id, /roll, /pick, /horoscope."
@@ -997,7 +1011,7 @@ async fn handle_roll(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "roll").await {
+    if !is_feature_enabled(config, msg.chat.id, "fun.roll").await {
         return Ok(());
     }
     // Full d20-style DSL via caith — supports advantage/disadvantage,
@@ -1069,7 +1083,7 @@ async fn handle_pick(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "pick").await {
+    if !is_feature_enabled(config, msg.chat.id, "fun.pick").await {
         return Ok(());
     }
     use rand::seq::SliceRandom;
@@ -1098,7 +1112,7 @@ async fn handle_pick(
 }
 
 async fn handle_horoscope(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "horoscope").await {
+    if !is_feature_enabled(config, msg.chat.id, "fun.horoscope").await {
         return Ok(());
     }
     use crate::dictionaries::CREATURES;
@@ -1132,7 +1146,7 @@ async fn handle_cha(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "cha").await {
+    if !is_feature_enabled(config, msg.chat.id, "tea.cha").await {
         return Ok(());
     }
     let Some(from) = msg.from.as_ref() else {
@@ -1165,7 +1179,7 @@ async fn handle_cha(
 }
 
 async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "sip").await {
+    if !is_feature_enabled(config, msg.chat.id, "tea.sip").await {
         return Ok(());
     }
     let Some(from) = msg.from.as_ref() else {
@@ -1415,7 +1429,7 @@ async fn handle_npkg(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "npkg").await {
+    if !is_feature_enabled(config, msg.chat.id, "nix.npkg").await {
         return Ok(());
     }
     let q = rest.trim();
@@ -1527,7 +1541,7 @@ async fn handle_nopt(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "nopt").await {
+    if !is_feature_enabled(config, msg.chat.id, "nix.nopt").await {
         return Ok(());
     }
     let q = rest.trim();
@@ -1603,7 +1617,7 @@ async fn handle_nixwhere(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "nixwhere").await {
+    if !is_feature_enabled(config, msg.chat.id, "nix.nixwhere").await {
         return Ok(());
     }
     let q = rest.trim();
@@ -1739,40 +1753,12 @@ fn position_to_url(position: &str) -> Option<String> {
 
 // ---------- per-chat feature toggles ----------
 
-/// In-code default for a feature when the chat has no explicit override.
-/// `npkg`/`nopt`/`nixwhere` default off (opt-in for nix-using chats);
-/// the cozy + utility extras default on (any chat can opt out via /feature).
-fn feature_default(name: &str) -> bool {
-    match name {
-        "npkg" | "nopt" | "nixwhere" | "nchan" | "nflake" => false,
-        "cha" | "sip" | "roll" | "pick" | "horoscope" => true,
-        _ => true,
-    }
-}
+use crate::features::{self, Action as FeatureAction, Pattern as FeaturePattern};
 
-const KNOWN_FEATURES: &[&str] = &[
-    "cha",
-    "sip",
-    "roll",
-    "pick",
-    "horoscope",
-    "npkg",
-    "nopt",
-    "nixwhere",
-    "nchan",
-    "nflake",
-];
-
-/// Resolve a feature flag for a chat: explicit override wins, else default.
+/// Thin call-site wrapper around [`features::is_enabled`] that takes the
+/// teloxide [`ChatId`] directly.
 async fn is_feature_enabled(config: &BotConfig, chat: ChatId, name: &str) -> bool {
-    match config.db.feature_override(chat.0, name).await {
-        Ok(Some(v)) => v,
-        Ok(None) => feature_default(name),
-        Err(e) => {
-            log::warn!("feature_override({chat}, {name}) failed: {e}");
-            feature_default(name)
-        }
-    }
+    features::is_enabled(&config.db, chat.0, name).await
 }
 
 /// Bot admin (TG_ADMIN_ID) always allowed; in groups, Telegram chat admins
@@ -1798,169 +1784,268 @@ async fn can_manage_features(bot: &Bot, msg: &Message, config: &BotConfig) -> bo
     }
 }
 
-/// Parse "a,b c,d  e" / "a b c" into a deduped, KNOWN-validated list.
-/// Returns (known, unknown).
-fn parse_feature_list<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
-    let mut known = Vec::new();
-    let mut unknown = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for tok in tokens {
-        for raw in tok.split(',') {
-            let name = raw.trim();
-            if name.is_empty() {
-                continue;
-            }
-            if !seen.insert(name) {
-                continue;
-            }
-            // Re-borrow the matching slice to extend lifetime to the
-            // 'static KNOWN_FEATURES table instead of the user input.
-            if let Some(&known_name) = KNOWN_FEATURES.iter().find(|k| **k == name) {
-                known.push(known_name);
-            } else {
-                unknown.push(name);
-            }
-        }
-    }
-    (known, unknown)
-}
-
-#[derive(Clone, Copy)]
-enum FeatureAction {
-    On,
-    Off,
-    Reset,
-}
-
-impl FeatureAction {
-    fn from_token(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" | "enable" => Some(Self::On),
-            "off" | "false" | "no" | "0" | "disable" => Some(Self::Off),
-            "reset" | "default" | "clear" | "unset" => Some(Self::Reset),
-            _ => None,
-        }
-    }
-    fn verb(&self) -> &'static str {
-        match self {
-            Self::On => "включён",
-            Self::Off => "выключен",
-            Self::Reset => "сброшен",
-        }
-    }
-}
-
 async fn handle_feature(
     bot: &Bot,
     msg: &Message,
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    let trimmed = rest.trim();
     let chat = msg.chat.id;
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
 
-    // Listing is open to everyone — read-only view of the chat's state.
-    if trimmed.is_empty() {
-        let mut lines = vec![format!("\u{2699}\u{FE0F} флаги в чате {}:", chat.0)];
-        for name in KNOWN_FEATURES {
-            let on = is_feature_enabled(config, chat, name).await;
-            let explicit = matches!(config.db.feature_override(chat.0, name).await, Ok(Some(_)));
-            let mark = if on { "\u{2705}" } else { "\u{274C}" };
-            let src = if explicit {
-                "явно"
-            } else {
-                "по умолчанию"
-            };
-            lines.push(format!("  {mark} {name} ({src})"));
-        }
-        lines.push("управление (для админов чата): /feature a,b,c on|off|reset".to_string());
-        bot.send_message(msg.chat.id, lines.join("\n"))
+    // /feature with no arguments — full listing of every leaf grouped by
+    // category, plus the chat's explicit rules.
+    if tokens.is_empty() {
+        let rules = config
+            .db
+            .feature_rules_for_chat(chat.0)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("feature_rules_for_chat({chat}): {e}");
+                Vec::new()
+            });
+        bot.send_message(chat, render_feature_overview(chat.0, &rules))
             .reply_parameters(reply_params(msg))
             .await?;
         return Ok(());
     }
 
-    // Modification requires admin rights — bot owner OR Telegram chat admin.
-    if !can_manage_features(bot, msg, config).await {
-        bot.send_message(msg.chat.id, "не ква, только админы чата могут это менять.")
-            .reply_parameters(reply_params(msg))
-            .await?;
-        return Ok(());
-    }
-
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    let Some((last, rest_tokens)) = parts.split_last() else {
-        return Ok(());
+    // Last token may be an action token — if so this is a write, else it's
+    // a scoped query over the listed prefixes.
+    let action = FeatureAction::from_token(tokens[tokens.len() - 1]);
+    let pattern_slice: &[&str] = match action {
+        Some(_) => &tokens[..tokens.len() - 1],
+        None => &tokens[..],
     };
-    let Some(action) = FeatureAction::from_token(last) else {
-        bot.send_message(
-            msg.chat.id,
-            "формат: /feature <имена через запятую> on|off|reset",
-        )
-        .reply_parameters(reply_params(msg))
-        .await?;
-        return Ok(());
-    };
-    let (features, unknown) = parse_feature_list(rest_tokens);
-    if features.is_empty() && unknown.is_empty() {
-        bot.send_message(
-            msg.chat.id,
-            format!(
-                "перечисли хотя бы один флаг. умею: {}",
-                KNOWN_FEATURES.join(", ")
-            ),
-        )
-        .reply_parameters(reply_params(msg))
-        .await?;
-        return Ok(());
-    }
 
-    let mut applied = Vec::new();
-    let mut failed = Vec::new();
-    for name in &features {
-        let res = match action {
-            FeatureAction::On => config.db.feature_set(chat.0, name, true).await,
-            FeatureAction::Off => config.db.feature_set(chat.0, name, false).await,
-            FeatureAction::Reset => config.db.feature_clear(chat.0, name).await,
-        };
-        match res {
-            Ok(()) => applied.push(*name),
-            Err(e) => {
-                log::warn!("feature_set({chat}, {name}): {e}");
-                failed.push(*name);
+    // Split on commas as well as whitespace; dedupe in input order.
+    let mut raw_patterns: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tok in pattern_slice {
+        for raw in tok.split(',') {
+            let s = raw.trim();
+            if !s.is_empty() && seen.insert(s.to_string()) {
+                raw_patterns.push(s.to_string());
             }
         }
     }
 
-    let mut lines = Vec::new();
-    if !applied.is_empty() {
-        let resolved_marks: Vec<String> =
-            futures::future::join_all(applied.iter().map(|n| async move {
-                let on = is_feature_enabled(config, chat, n).await;
-                format!("{} {n}", if on { "\u{2705}" } else { "\u{274C}" })
-            }))
-            .await;
-        lines.push(format!(
-            "{}: {} — сейчас {}",
-            action.verb(),
-            applied.join(", "),
-            resolved_marks.join(", ")
-        ));
+    if raw_patterns.is_empty() {
+        bot.send_message(
+            chat,
+            "формат: /feature <шаблон>[, <шаблон>] [on|off|reset]\n\
+             пример: /feature nix.* on; /feature util.time.tz off; /feature util.** reset",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
     }
-    if !unknown.is_empty() {
-        lines.push(format!(
-            "пропущено (неизвестные): {}. умею: {}",
-            unknown.join(", "),
-            KNOWN_FEATURES.join(", ")
-        ));
+
+    // Normalize every pattern up front so query and write share the same
+    // validation. Bad patterns are reported alongside results.
+    let mut patterns: Vec<FeaturePattern> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for raw in &raw_patterns {
+        match features::normalize_pattern(raw) {
+            Ok(p) => patterns.push(p),
+            Err(e) => bad.push(format!("{raw}: {e}")),
+        }
+    }
+
+    // ===== Query path =====
+    if action.is_none() {
+        let rules = config
+            .db
+            .feature_rules_for_chat(chat.0)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("feature_rules_for_chat({chat}): {e}");
+                Vec::new()
+            });
+        let mut sections: Vec<String> = patterns
+            .iter()
+            .map(|p| render_feature_subtree(&rules, p))
+            .collect();
+        if !bad.is_empty() {
+            sections.push(format!("пропущено: {}", bad.join("; ")));
+        }
+        bot.send_message(chat, sections.join("\n\n"))
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+
+    // ===== Write path =====
+    let action = action.unwrap();
+
+    if !can_manage_features(bot, msg, config).await {
+        bot.send_message(chat, "не ква, только админы чата могут это менять.")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+
+    // `<prefix>.**` is reset-only — refuse on/off early so the user sees the
+    // mistake before any DB write happens.
+    if matches!(action, FeatureAction::On | FeatureAction::Off)
+        && patterns
+            .iter()
+            .any(|p| matches!(p, FeaturePattern::Recursive(_)))
+    {
+        bot.send_message(
+            chat,
+            "** работает только с reset. для on/off укажите конкретный шаблон, например util.* on",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let mut applied: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for p in &patterns {
+        let outcome: Result<String, rusqlite::Error> = match (action, p) {
+            (FeatureAction::On | FeatureAction::Off, _) => {
+                let stored = p
+                    .stored()
+                    .expect("recursive patterns rejected above for on/off");
+                let val = matches!(action, FeatureAction::On);
+                config
+                    .db
+                    .feature_set(chat.0, stored, val)
+                    .await
+                    .map(|()| p.display())
+            }
+            (FeatureAction::Reset, FeaturePattern::Recursive(prefix)) => config
+                .db
+                .feature_clear_prefix(chat.0, prefix)
+                .await
+                .map(|n| format!("{} ({n})", p.display())),
+            (FeatureAction::Reset, _) => {
+                let stored = p.stored().expect("non-recursive has a stored form");
+                config
+                    .db
+                    .feature_clear(chat.0, stored)
+                    .await
+                    .map(|()| p.display())
+            }
+        };
+        match outcome {
+            Ok(label) => applied.push(label),
+            Err(e) => {
+                log::warn!("feature {:?} {}: {e}", action, p.display());
+                failed.push(p.display());
+            }
+        }
+    }
+
+    // Recompute effective state across leaves touched by the patterns we
+    // applied, so the user sees the resolved ✅/❌.
+    let rules = config
+        .db
+        .feature_rules_for_chat(chat.0)
+        .await
+        .unwrap_or_default();
+    let mut effective: Vec<String> = Vec::new();
+    for p in &patterns {
+        for leaf in features::leaves_matching(p) {
+            let (on, _) = features::resolve(&rules, leaf.path);
+            let mark = if on { "\u{2705}" } else { "\u{274C}" };
+            effective.push(format!("  {mark} {}", leaf.path));
+        }
+    }
+    effective.sort();
+    effective.dedup();
+
+    let mut lines: Vec<String> = Vec::new();
+    if !applied.is_empty() {
+        lines.push(format!("{}: {}", action.verb(), applied.join(", ")));
+    }
+    if !effective.is_empty() {
+        lines.push("сейчас:".to_string());
+        lines.extend(effective);
+    }
+    if !bad.is_empty() {
+        lines.push(format!("пропущено: {}", bad.join("; ")));
     }
     if !failed.is_empty() {
-        lines.push(format!("ошибка на: {}", failed.join(", ")));
+        lines.push(format!("ошибка: {}", failed.join(", ")));
     }
-    bot.send_message(msg.chat.id, lines.join("\n"))
+    if lines.is_empty() {
+        lines.push("ничего не изменено.".to_string());
+    }
+
+    bot.send_message(chat, lines.join("\n"))
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
+}
+
+/// Full per-chat state: declared rules + effective on/off for every
+/// registered leaf, grouped by top-level category.
+fn render_feature_overview(chat_id: i64, rules: &[(String, bool)]) -> String {
+    let mut lines: Vec<String> = vec![format!("\u{2699}\u{FE0F} флаги в чате {chat_id}:")];
+
+    if rules.is_empty() {
+        lines.push("правил нет — всё по умолчанию.".to_string());
+    } else {
+        lines.push("правила:".to_string());
+        for (pat, val) in rules {
+            let mark = if *val { "on " } else { "off" };
+            lines.push(format!("  {mark}  {pat}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("эффективно:".to_string());
+    for cat in features::categories() {
+        let cat_prefix = format!("{cat}.");
+        let mut header_pushed = false;
+        for f in features::FEATURES
+            .iter()
+            .filter(|f| f.path.starts_with(&cat_prefix) || f.path == cat)
+        {
+            if !header_pushed {
+                lines.push(format!("  [{cat}]"));
+                header_pushed = true;
+            }
+            let (on, by) = features::resolve(rules, f.path);
+            let mark = if on { "\u{2705}" } else { "\u{274C}" };
+            let src = by
+                .map(|r| format!("← {r}"))
+                .unwrap_or_else(|| "← default".to_string());
+            lines.push(format!("    {mark} {} {src}", f.path));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "управление (для админов): /feature <шаблон>[, <шаблон>] on|off|reset".to_string(),
+    );
+    lines.push(
+        "примеры: /feature nix.* on; /feature util.time.tz off; /feature util.** reset".to_string(),
+    );
+    lines.join("\n")
+}
+
+/// Effective state for the leaves under one pattern. Used by the
+/// `/feature <prefix>` query form.
+fn render_feature_subtree(rules: &[(String, bool)], pat: &FeaturePattern) -> String {
+    let mut lines = vec![format!("[{}]", pat.display())];
+    let leaves = features::leaves_matching(pat);
+    if leaves.is_empty() {
+        lines.push("  (пусто)".to_string());
+        return lines.join("\n");
+    }
+    for leaf in leaves {
+        let (on, by) = features::resolve(rules, leaf.path);
+        let mark = if on { "\u{2705}" } else { "\u{274C}" };
+        let src = by
+            .map(|r| format!("← {r}"))
+            .unwrap_or_else(|| "← default".to_string());
+        lines.push(format!("  {mark} {} {src}", leaf.path));
+    }
+    lines.join("\n")
 }
 
 // ---------- /nchan + /nflake — live nix channel & flake registry ----------
@@ -1971,7 +2056,7 @@ async fn handle_nchan(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "nchan").await {
+    if !is_feature_enabled(config, msg.chat.id, "nix.nchan").await {
         return Ok(());
     }
     let arg = rest.trim();
@@ -2009,7 +2094,7 @@ async fn handle_nflake(
     rest: &str,
     config: &BotConfig,
 ) -> anyhow::Result<()> {
-    if !is_feature_enabled(config, msg.chat.id, "nflake").await {
+    if !is_feature_enabled(config, msg.chat.id, "nix.nflake").await {
         return Ok(());
     }
     let q = rest.trim();

@@ -429,31 +429,6 @@ impl Db {
 
     // ---------- per-chat feature toggles ----------
 
-    /// Returns the override stored for this chat/feature, or `None` if the
-    /// caller should fall back to the in-code default.
-    pub async fn feature_override(
-        &self,
-        chat_id: i64,
-        feature: &str,
-    ) -> rusqlite::Result<Option<bool>> {
-        let conn = self.conn.clone();
-        let feature = feature.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn
-                .prepare("SELECT enabled FROM chat_features WHERE chat_id = ?1 AND feature = ?2")?;
-            let mut rows = stmt.query(rusqlite::params![chat_id, feature])?;
-            if let Some(row) = rows.next()? {
-                let v: i64 = row.get(0)?;
-                Ok::<_, rusqlite::Error>(Some(v != 0))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-    }
-
     pub async fn feature_set(
         &self,
         chat_id: i64,
@@ -470,6 +445,57 @@ impl Db {
                 rusqlite::params![chat_id, feature, if enabled { 1 } else { 0 }],
             )?;
             Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// All rules (pattern, enabled) for a chat. Used by the hierarchical
+    /// resolver in [`crate::features`].
+    pub async fn feature_rules_for_chat(
+        &self,
+        chat_id: i64,
+    ) -> rusqlite::Result<Vec<(String, bool)>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                "SELECT feature, enabled FROM chat_features WHERE chat_id = ?1 ORDER BY feature",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![chat_id], |row| {
+                let pat: String = row.get(0)?;
+                let en: i64 = row.get(1)?;
+                Ok((pat, en != 0))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok::<_, rusqlite::Error>(out)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Delete every rule whose pattern starts with `<prefix>.`, plus an
+    /// exact match on `<prefix>` itself. Backs `/feature <prefix>.** reset`.
+    /// Returns the number of rows removed.
+    pub async fn feature_clear_prefix(
+        &self,
+        chat_id: i64,
+        prefix: &str,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.clone();
+        let exact = prefix.to_string();
+        let like = format!("{prefix}.%");
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let n = conn.execute(
+                "DELETE FROM chat_features WHERE chat_id = ?1 \
+                 AND (feature = ?2 OR feature LIKE ?3)",
+                rusqlite::params![chat_id, exact, like],
+            )?;
+            Ok::<_, rusqlite::Error>(n)
         })
         .await
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
