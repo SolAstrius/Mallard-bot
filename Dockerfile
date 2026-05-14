@@ -2,15 +2,13 @@
 # ---- builder ------------------------------------------------------------
 FROM rust:1.90-slim-bookworm AS builder
 
-# symbolica → rug → gmp-mpfr-sys needs m4 + system math libs at build time.
-# Headers + lib archives go into the final binary; runtime image doesn't
-# need these.
+# symbolica → rug → gmp-mpfr-sys builds GMP/MPFR/MPC from source at build
+# time. Needs a C toolchain + m4. The compiled libraries are statically
+# linked into the release binary, so the runtime image stays slim.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        build-essential \
         m4 \
-        libgmp-dev \
-        libmpfr-dev \
-        libmpc-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
