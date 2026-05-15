@@ -31,8 +31,12 @@ pub struct BotConfig {
     pub admin_id: Option<UserId>,
     pub pack: Option<StickerPack>,
     pub db: crate::db::Db,
-    pub tea_sessions: crate::sessions::SessionStore,
+    pub chabani: crate::sessions::ChabaniStore,
     pub bot_username: String,
+    /// Effective `getFile` size cap. 20 MB when the bot talks to the
+    /// hosted api.telegram.org; up to 2 GB when pointing at a
+    /// self-hosted Bot API server via `TG_API_URL`.
+    pub download_max_bytes: u32,
 }
 
 #[derive(BotCommands, Clone)]
@@ -60,9 +64,9 @@ pub enum Command {
     Pick(String),
     #[command(description = "гороскоп на сегодня для одной из зверушек")]
     Horoscope,
-    #[command(description = "чайная сессия: /cha <чай>, /cha who, /cha log, /cha end")]
+    #[command(description = "чабань: /cha [название], /cha join, /cha here, /cha leave — кряква присматривает за чаем")]
     Cha(String),
-    #[command(description = "следующая заварка в активной сессии")]
+    #[command(description = "следующая заварка за твоей чабанью")]
     Sip,
     #[command(description = "поиск пакета в nixpkgs: /npkg ripgrep")]
     Npkg(String),
@@ -333,19 +337,19 @@ const HELP_DNS: &str = "/dns — DNS-тулчейн для sysadmin'ов.\n\
 Включённые резолверы и таймаут — через /feature dns.\n\
 кря-кря.";
 
-const HELP_CHA: &str = "/cha — чайная сессия.\n\
-Кряква считает заварки и помнит, кто сейчас пьёт чай.\n\
-* /cha <название> — начать сессию (название — свободный текст)\n\
-* /sip — следующая заварка в твоей активной сессии\n\
-* /cha note <заметка> — добавить заметку\n\
-* /cha end — закрыть сессию\n\
-* /cha who — кто сейчас пьёт в этом чате\n\
-* /cha log — последние 10 закрытых сессий в этом чате\n\
-* /cha gossip — кто сейчас пьёт в любых ваших общих чатах (opt-in)\n\
-* /cha gossip on|off — подключиться/отключиться от кросс-чатовой видимости\n\
-* /cha — без аргументов: статус твоей активной сессии или эта подсказка.\n\
-Сессии автоматически закрываются после 90 минут без активности.\n\
-кря-кря.";
+const HELP_CHA: &str = "/cha — кряква присматривает за чаем.\n\
+Чабань — это стол, за которым пьют. За одну чабань может сесть несколько человек, в том числе из разных чатов.\n\
+* /cha [название] — сесть за свою чабань (название по желанию)\n\
+* /cha join @user или /cha join <id> — подсесть к чужой чабани\n\
+* /sip — следующая заварка. видят все, кто за этой же чабанью\n\
+* /cha leave — встать. если ты был последним — чабань закрывается\n\
+* /cha note <текст> — заметка к чабани (приписывается тебе)\n\
+* /cha here — кто пьёт в этом чате\n\
+* /cha world — кто пьёт где (только в открытых для обзора чатах)\n\
+* /cha last — последние 10 закрытых чабаней этого чата\n\
+* /cha id — id твоей чабани, чтобы поделиться\n\
+* /cha presence on|off — открыть/закрыть этот чат для обзора (по умолчанию закрыт)\n\
+Сама закроется через 90 минут тишины. кря.";
 
 fn help_for(query: &str) -> String {
     let q = query.trim().trim_start_matches('/').to_ascii_lowercase();
@@ -1844,12 +1848,16 @@ async fn handle_horoscope(bot: &Bot, msg: &Message, config: &BotConfig) -> anyho
     Ok(())
 }
 
-// ---------- /cha + /sip — gong fu cha session tracking ----------
+// ---------- /cha + /sip — chabani (shared-teapot) tracking ----------
 
-use crate::sessions::{fmt_dur, parse_notes, persist, TeaSession};
+use crate::sessions::{
+    fmt_dur, parse_notes, parse_participants, persist_closed, Chabani, SessionId,
+};
 
-const CHA_AUTO_CLOSE_NOTE: bool = false;
-
+/// Dispatcher for `/cha` and its sub-commands. Sub-command parsing is a
+/// simple `(first_word, rest)` split — `note` and `join` take a non-empty
+/// argument; everything else either takes none or a free-text label that
+/// becomes the chabani's name.
 async fn handle_cha(
     bot: &Bot,
     msg: &Message,
@@ -1863,13 +1871,18 @@ async fn handle_cha(
         return Ok(());
     };
     let user_id = from.id;
-    let user_name = from
-        .username
-        .as_ref()
-        .map(|n| format!("@{n}"))
-        .unwrap_or_else(|| from.full_name());
+    let user_name = handle_display_name(from);
     let chat_id = msg.chat.id;
-    let key = (chat_id, user_id);
+    let is_dm = matches!(msg.chat.kind, ChatKind::Private(_));
+
+    // First touch in a DM auto-enables presence — DMs are 1:1 with the bot, so
+    // there's no group-privacy concern, and the user wants their sip echoes
+    // to land in their own DM.
+    if is_dm {
+        if let Err(e) = config.db.set_chat_tea_aware(chat_id.0, true).await {
+            log::warn!("auto tea_aware for DM {chat_id}: {e}");
+        }
+    }
 
     let trimmed = rest.trim();
     let (sub, sub_arg) = match trimmed.split_once(char::is_whitespace) {
@@ -1878,16 +1891,22 @@ async fn handle_cha(
     };
 
     match sub.as_str() {
-        "" => cha_status_or_help(bot, msg, config, key).await,
-        "who" => cha_who(bot, msg, config).await,
-        "log" => cha_log(bot, msg, config, chat_id).await,
-        "gossip" => cha_gossip(bot, msg, config, sub_arg).await,
-        "end" => cha_end(bot, msg, config, key).await,
-        "note" if !sub_arg.is_empty() => cha_note(bot, msg, config, key, sub_arg).await,
+        "" => cha_status_or_help(bot, msg, config, user_id).await,
+        "here" => cha_here(bot, msg, config).await,
+        "world" => cha_world(bot, msg, config).await,
+        "last" => cha_last(bot, msg, config, chat_id).await,
+        "join" => cha_join(bot, msg, config, user_id, user_name, chat_id, sub_arg).await,
+        "leave" => cha_leave(bot, msg, config, user_id).await,
+        "note" if !sub_arg.is_empty() => cha_note(bot, msg, config, user_id, sub_arg).await,
+        "id" => cha_id(bot, msg, config, user_id).await,
+        "presence" => cha_presence(bot, msg, config, sub_arg).await,
         _ => cha_start(bot, msg, config, chat_id, user_id, user_name, trimmed).await,
     }
 }
 
+/// `/sip` — bump the caller's chabani's shared steep counter, then fan out
+/// an echo to the caller's chat plus every tea-aware chat where another
+/// participant is a member.
 async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
     if !is_feature_enabled(config, msg.chat.id, "tea.sip").await {
         return Ok(());
@@ -1895,34 +1914,40 @@ async fn handle_sip(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Res
     let Some(from) = msg.from.as_ref() else {
         return Ok(());
     };
-    let key = (msg.chat.id, from.id);
-    let summary = {
-        let mut store = config.tea_sessions.lock().await;
-        match store.get_mut(&key) {
-            Some(s) => {
-                s.sip();
-                Some((s.user_name.clone(), s.tea.clone(), s.steeps))
-            }
-            None => None,
-        }
+    let user_id = from.id;
+
+    // Lock once: mutate + take a snapshot for rendering and fan-out.
+    let snapshot: Option<Chabani> = {
+        let mut state = config.chabani.lock().await;
+        state.chabani_of_mut(user_id).map(|c| {
+            c.sip();
+            c.clone()
+        })
     };
-    let body = match summary {
-        Some((name, tea, steeps)) => {
-            format!(
-                "\u{1F375} {ord}-я заварка, {name}, {tea}",
-                ord = steeps,
-                name = name,
-                tea = tea
-            )
-        }
-        None => "у тебя нет активной сессии. начни через /cha <название>".to_string(),
-    };
-    bot.send_message(msg.chat.id, body)
+
+    let Some(chabani) = snapshot else {
+        bot.send_message(
+            msg.chat.id,
+            "ты не за чабанью. сесть: /cha [название]".to_string(),
+        )
         .reply_parameters(reply_params(msg))
         .await?;
+        return Ok(());
+    };
+
+    let caller_name = handle_display_name(from);
+    let body = format_sip_line(&caller_name, &chabani);
+    // Caller's chat is always a destination (it's the reply context).
+    bot.send_message(msg.chat.id, body.clone())
+        .reply_parameters(reply_params(msg))
+        .await?;
+    echo_sip(bot, &config.db, &chabani, msg.chat.id, &body).await;
     Ok(())
 }
 
+/// Opens a fresh chabani for `user_id` and sends the start ack. If the user
+/// was already seated at another chabani, the prior one is closed first
+/// (last participant out → persisted as `auto_closed=false`).
 async fn cha_start(
     bot: &Bot,
     msg: &Message,
@@ -1930,29 +1955,156 @@ async fn cha_start(
     chat_id: ChatId,
     user_id: UserId,
     user_name: String,
-    tea: &str,
+    label: &str,
 ) -> anyhow::Result<()> {
-    let tea = if tea.is_empty() { "?" } else { tea };
-    let key = (chat_id, user_id);
-    let previous = {
-        let mut store = config.tea_sessions.lock().await;
-        let prev = store.remove(&key);
-        store.insert(
-            key,
-            TeaSession::new(chat_id, user_id, user_name.clone(), tea.to_string()),
-        );
-        prev
+    let label = if label.is_empty() {
+        "?".to_string()
+    } else {
+        label.to_string()
     };
-    // If a session was already running, persist it as auto-closed-by-restart.
-    if let Some(prev) = previous {
-        persist(&config.db, &prev, true).await;
+
+    let (closed, new_id) = {
+        let mut state = config.chabani.lock().await;
+        // Leave whatever chabani we were at first; closes it if we were
+        // the last participant.
+        let closed = state.remove_participant(user_id);
+        let id = state.open(label.clone(), user_id, user_name.clone(), chat_id);
+        (closed, id)
+    };
+    if let Some(prev) = closed {
+        persist_closed(&config.db, &prev, false).await;
     }
-    bot.send_message(
-        msg.chat.id,
-        format!("\u{1FAD6} {user_name} начал(а) сессию: {tea}\nкряква садится рядом \u{1F60C}"),
-    )
-    .reply_parameters(reply_params(msg))
-    .await?;
+    bot.send_message(msg.chat.id, format!("сел за чабань ({label}) · {new_id}"))
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+/// Attaches the caller to an existing chabani by id or by `@handle`. Refuses
+/// if they're already at one (must `/cha leave` first — keeps the "one
+/// teapot per person" invariant explicit).
+async fn cha_join(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    user_id: UserId,
+    user_name: String,
+    chat_id: ChatId,
+    arg: &str,
+) -> anyhow::Result<()> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "формат: /cha join @user или /cha join <id>".to_string(),
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    // Resolve target chabani id. @handle lookup walks the live store; bare
+    // tokens are tried as a session id directly.
+    let target_id: Option<SessionId> = {
+        let state = config.chabani.lock().await;
+        if let Some(handle) = arg.strip_prefix('@') {
+            let needle = format!("@{handle}");
+            state
+                .by_id
+                .values()
+                .find(|c| c.participants.values().any(|p| p.user_name == needle))
+                .map(|c| c.id.clone())
+        } else {
+            let candidate = SessionId(arg.to_string());
+            if state.by_id.contains_key(&candidate) {
+                Some(candidate)
+            } else {
+                None
+            }
+        }
+    };
+
+    let Some(target_id) = target_id else {
+        let body = if arg.starts_with('@') {
+            format!("{arg} сейчас не за чабанью")
+        } else {
+            "такой чабани нет".to_string()
+        };
+        bot.send_message(msg.chat.id, body)
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    };
+
+    let (label, already_seated_other) = {
+        let state = config.chabani.lock().await;
+        let label = state
+            .by_id
+            .get(&target_id)
+            .map(|c| c.label.clone())
+            .unwrap_or_else(|| "?".to_string());
+        let already = state
+            .by_user
+            .get(&user_id)
+            .filter(|id| **id != target_id)
+            .cloned();
+        (label, already)
+    };
+    if let Some(other) = already_seated_other {
+        let other_label = {
+            let state = config.chabani.lock().await;
+            state
+                .by_id
+                .get(&other)
+                .map(|c| c.label.clone())
+                .unwrap_or_else(|| "?".to_string())
+        };
+        bot.send_message(
+            msg.chat.id,
+            format!("ты уже за чабанью ({other_label}), /cha leave чтобы пересесть"),
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    {
+        let mut state = config.chabani.lock().await;
+        state.add_participant(&target_id, user_id, user_name, chat_id);
+    }
+    bot.send_message(msg.chat.id, format!("подсел к чабани ({label})"))
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+/// Leaves the caller's chabani. If they were the last participant, the
+/// teapot is closed and persisted; otherwise it lives on without them.
+async fn cha_leave(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    user_id: UserId,
+) -> anyhow::Result<()> {
+    let closed = {
+        let mut state = config.chabani.lock().await;
+        if !state.by_user.contains_key(&user_id) {
+            None
+        } else {
+            Some(state.remove_participant(user_id))
+        }
+    };
+    let body = match closed {
+        None => "ты не за чабанью".to_string(),
+        Some(None) => "встал из-за чабани".to_string(),
+        Some(Some(ref c)) => format!("убрал чайник ({})", c.label),
+    };
+    if let Some(Some(c)) = closed {
+        persist_closed(&config.db, &c, false).await;
+    }
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
     Ok(())
 }
 
@@ -1960,18 +2112,18 @@ async fn cha_status_or_help(
     bot: &Bot,
     msg: &Message,
     config: &BotConfig,
-    key: (ChatId, UserId),
+    user_id: UserId,
 ) -> anyhow::Result<()> {
     let snapshot = {
-        let store = config.tea_sessions.lock().await;
-        store.get(&key).cloned()
+        let state = config.chabani.lock().await;
+        state.chabani_of(user_id).cloned()
     };
     let body = match snapshot {
-        Some(s) => format!(
-            "\u{1F375} {}, {} заварок, {}",
-            s.tea,
-            s.steeps,
-            fmt_dur(s.elapsed())
+        Some(c) => format!(
+            "{} · {}-я заварка · {}",
+            c.label,
+            c.sips,
+            fmt_dur(c.elapsed())
         ),
         None => HELP_CHA.to_string(),
     };
@@ -1985,23 +2137,23 @@ async fn cha_note(
     bot: &Bot,
     msg: &Message,
     config: &BotConfig,
-    key: (ChatId, UserId),
+    user_id: UserId,
     text: &str,
 ) -> anyhow::Result<()> {
     let ok = {
-        let mut store = config.tea_sessions.lock().await;
-        match store.get_mut(&key) {
-            Some(s) => {
-                s.add_note(text.to_string());
+        let mut state = config.chabani.lock().await;
+        match state.chabani_of_mut(user_id) {
+            Some(c) => {
+                c.add_note(user_id, text.to_string());
                 true
             }
             None => false,
         }
     };
     let body = if ok {
-        "\u{2713} записано".to_string()
+        "записано".to_string()
     } else {
-        "у тебя нет активной сессии :(".to_string()
+        "ты не за чабанью".to_string()
     };
     bot.send_message(msg.chat.id, body)
         .reply_parameters(reply_params(msg))
@@ -2009,68 +2161,47 @@ async fn cha_note(
     Ok(())
 }
 
-async fn cha_end(
+async fn cha_id(
     bot: &Bot,
     msg: &Message,
     config: &BotConfig,
-    key: (ChatId, UserId),
+    user_id: UserId,
 ) -> anyhow::Result<()> {
-    let closed = {
-        let mut store = config.tea_sessions.lock().await;
-        store.remove(&key)
+    let body = {
+        let state = config.chabani.lock().await;
+        match state.chabani_of(user_id) {
+            Some(c) => format!("{} · {}", c.id, c.label),
+            None => "ты не за чабанью".to_string(),
+        }
     };
-    let Some(session) = closed else {
-        bot.send_message(msg.chat.id, "у тебя нет активной сессии :(")
-            .reply_parameters(reply_params(msg))
-            .await?;
-        return Ok(());
-    };
-    let body = format!(
-        "\u{1FAD6} {} закрыл(а) сессию: {}, {} заварок, {}\nкряква уважает",
-        session.user_name,
-        session.tea,
-        session.steeps,
-        fmt_dur(session.elapsed()),
-    );
-    persist(&config.db, &session, CHA_AUTO_CLOSE_NOTE).await;
     bot.send_message(msg.chat.id, body)
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
 }
 
-async fn cha_who(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
-    let active: Vec<(
-        String,
-        String,
-        u32,
-        std::time::Duration,
-        std::time::Duration,
-    )> = {
-        let store = config.tea_sessions.lock().await;
-        store
-            .iter()
-            .filter(|((c, _), _)| *c == msg.chat.id)
-            .map(|(_, s)| {
-                (
-                    s.user_name.clone(),
-                    s.tea.clone(),
-                    s.steeps,
-                    s.elapsed(),
-                    s.idle_for(),
-                )
-            })
+/// `/cha here` — chabani currently visible from this chat. A chabani is
+/// visible iff at least one of its participants has been seen in this chat.
+async fn cha_here(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    let chat_id = msg.chat.id;
+    let members: std::collections::HashSet<UserId> = membership_for_chat(&config.db, chat_id).await;
+    let rendered: Vec<String> = {
+        let state = config.chabani.lock().await;
+        state
+            .by_id
+            .values()
+            .filter(|c| c.participants.keys().any(|u| members.contains(u)))
+            .map(|c| render_chabani_row(c, &members))
             .collect()
     };
-    let body = if active.is_empty() {
-        "тихо :(\nможет ты начнёшь?".to_string()
+    let body = if rendered.is_empty() {
+        "пусто".to_string()
+    } else if rendered.len() == 1 {
+        rendered.into_iter().next().unwrap()
     } else {
-        let mut lines = vec!["\u{1F375} кто сейчас пьёт:".to_string()];
-        for (name, tea, steeps, elapsed, idle) in active {
-            lines.push(format!(
-                "  {name}, {tea}, {steeps} заварок, {ago}",
-                ago = fmt_dur(idle.max(elapsed))
-            ));
+        let mut lines = vec!["чабани:".to_string()];
+        for r in rendered {
+            lines.push(format!("  {r}"));
         }
         lines.join("\n")
     };
@@ -2080,29 +2211,113 @@ async fn cha_who(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result
     Ok(())
 }
 
-async fn cha_log(bot: &Bot, msg: &Message, config: &BotConfig, chat: ChatId) -> anyhow::Result<()> {
-    let rows = match config.db.tail_cha_log(chat.0, 10).await {
+/// `/cha world` — chabani visible across all tea-aware chats. Listed with
+/// "где: <origin>" only when the origin chat is itself tea-aware; otherwise
+/// the origin is anonymized.
+async fn cha_world(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    if !is_tea_aware(&config.db, msg.chat.id, &msg.chat.kind).await {
+        bot.send_message(
+            msg.chat.id,
+            "этот чат закрыт для обзора. /cha presence on чтобы открыть".to_string(),
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+    let aware = config.db.tea_aware_chats().await.unwrap_or_default();
+    let lines: Vec<String> = {
+        let state = config.chabani.lock().await;
+        let mut out = Vec::new();
+        for c in state.by_id.values() {
+            // A chabani is "in the world" if any participant has been seen in
+            // any tea-aware chat (== that chat would echo its sips).
+            let participant_chats: Vec<ChatId> = {
+                let mut all = Vec::new();
+                for u in c.participants.keys() {
+                    let ids = config
+                        .db
+                        .chats_for_user(u.0 as i64)
+                        .await
+                        .unwrap_or_default();
+                    for id in ids {
+                        all.push(ChatId(id));
+                    }
+                }
+                all
+            };
+            let visible = participant_chats.iter().any(|cid| aware.contains(&cid.0));
+            if !visible {
+                continue;
+            }
+            let participants = c
+                .participants
+                .values()
+                .map(|p| p.user_name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let origin = if aware.contains(&c.origin_chat.0) {
+                format!(" · где: {}", c.origin_chat.0)
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "{} · {}-я · {participants}{origin}",
+                c.label, c.sips
+            ));
+        }
+        out
+    };
+    let body = if lines.is_empty() {
+        "тихо".to_string()
+    } else {
+        let mut all = vec!["чабани в мире:".to_string()];
+        for l in lines {
+            all.push(format!("  {l}"));
+        }
+        all.join("\n")
+    };
+    bot.send_message(msg.chat.id, body)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+async fn cha_last(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    chat: ChatId,
+) -> anyhow::Result<()> {
+    let rows = match config.db.tail_chabani_by_origin(chat.0, 10).await {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("cha_log query failed: {e}");
+            log::warn!("cha_last query failed: {e}");
             Vec::new()
         }
     };
     let body = if rows.is_empty() {
-        "журнал пуст :(\nначни через /cha <название>".to_string()
+        "пусто".to_string()
     } else {
-        let mut lines = vec!["\u{1F4D6} последние сессии:".to_string()];
+        let mut lines = vec!["последние чабани:".to_string()];
         for r in rows {
             let when = format_unix_short(r.started_at);
             let dur = fmt_dur(std::time::Duration::from_secs(r.duration_s as u64));
             let auto = if r.auto_closed { ", авто" } else { "" };
+            let participants = parse_participants(&r.participants_json);
+            let names: Vec<String> = participants.into_iter().map(|(_, n, _)| n).collect();
+            let who = if names.is_empty() {
+                "?".to_string()
+            } else {
+                names.join(", ")
+            };
             let notes = parse_notes(&r.notes_json);
             let mut entry = format!(
-                "  {when}, {}, {}, {} заварок, {dur}{auto}",
-                r.user_name, r.tea, r.steeps
+                "  {when} · {} · {who} · {}-я · {dur}{auto}",
+                r.label, r.sips
             );
             if !notes.is_empty() {
-                entry.push_str(&format!("\n    заметки: {}", notes.join(", ")));
+                let note_texts: Vec<String> = notes.into_iter().map(|(_, t)| t).collect();
+                entry.push_str(&format!("\n    заметки: {}", note_texts.join(", ")));
             }
             lines.push(entry);
         }
@@ -2112,6 +2327,176 @@ async fn cha_log(bot: &Bot, msg: &Message, config: &BotConfig, chat: ChatId) -> 
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
+}
+
+/// Toggles `cha_chat_settings.tea_aware`. Admin-only in groups; in DMs it's
+/// a no-op (they're always on after first interaction).
+async fn cha_presence(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    arg: &str,
+) -> anyhow::Result<()> {
+    let is_dm = matches!(msg.chat.kind, ChatKind::Private(_));
+    if is_dm {
+        bot.send_message(msg.chat.id, "в личке всегда открыто")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+    if !can_manage_features(bot, msg, config).await {
+        bot.send_message(msg.chat.id, "только для админов")
+            .reply_parameters(reply_params(msg))
+            .await?;
+        return Ok(());
+    }
+    let on = match arg.trim().to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "вкл" => Some(true),
+        "off" | "false" | "no" | "0" | "выкл" => Some(false),
+        "" => None,
+        _ => {
+            bot.send_message(msg.chat.id, "формат: /cha presence on|off")
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+    match on {
+        Some(state) => {
+            if let Err(e) = config.db.set_chat_tea_aware(msg.chat.id.0, state).await {
+                log::warn!("set_chat_tea_aware: {e}");
+            }
+            let body = if state {
+                "чат открыт для обзора"
+            } else {
+                "чат закрыт для обзора"
+            };
+            bot.send_message(msg.chat.id, body)
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+        None => {
+            let cur = config
+                .db
+                .is_chat_tea_aware(msg.chat.id.0)
+                .await
+                .unwrap_or(false);
+            let body = if cur {
+                "чат открыт для обзора"
+            } else {
+                "чат закрыт для обзора"
+            };
+            bot.send_message(msg.chat.id, body)
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_display_name(from: &teloxide::types::User) -> String {
+    from.username
+        .as_ref()
+        .map(|n| format!("@{n}"))
+        .unwrap_or_else(|| from.full_name())
+}
+
+/// Format the sip echo body. Third-person so the same string makes sense
+/// in the caller's chat *and* in echoed-to chats with no shared frame.
+fn format_sip_line(caller_name: &str, c: &Chabani) -> String {
+    let others: Vec<&str> = c
+        .participants
+        .values()
+        .filter_map(|p| {
+            if p.user_name == caller_name {
+                None
+            } else {
+                Some(p.user_name.as_str())
+            }
+        })
+        .collect();
+    let tail = if others.is_empty() {
+        String::new()
+    } else {
+        format!(" · с {}", others.join(", "))
+    };
+    format!(
+        "\u{1F375} {caller_name} · {}-я заварка ({}){}",
+        c.sips, c.label, tail
+    )
+}
+
+/// Format one `/cha here` row: `label · N-я · @a, @b (+M не отсюда)`.
+fn render_chabani_row(c: &Chabani, members: &std::collections::HashSet<UserId>) -> String {
+    let mut here: Vec<&str> = Vec::new();
+    let mut off = 0u32;
+    for (uid, p) in &c.participants {
+        if members.contains(uid) {
+            here.push(p.user_name.as_str());
+        } else {
+            off += 1;
+        }
+    }
+    let off_tag = if off > 0 {
+        format!(" (+{off} не отсюда)")
+    } else {
+        String::new()
+    };
+    let who = if here.is_empty() {
+        "?".to_string()
+    } else {
+        here.join(", ")
+    };
+    format!("{} · {}-я · {who}{off_tag}", c.label, c.sips)
+}
+
+async fn echo_sip(
+    bot: &Bot,
+    db: &crate::db::Db,
+    chabani: &Chabani,
+    caller_chat: ChatId,
+    body: &str,
+) {
+    let aware = db.tea_aware_chats().await.unwrap_or_default();
+    let mut dests: std::collections::HashSet<ChatId> =
+        std::collections::HashSet::from([caller_chat]);
+    for uid in chabani.participants.keys() {
+        let chats = db.chats_for_user(uid.0 as i64).await.unwrap_or_default();
+        for c in chats {
+            if aware.contains(&c) {
+                dests.insert(ChatId(c));
+            }
+        }
+    }
+    dests.remove(&caller_chat); // caller's chat already got the reply
+    for d in dests {
+        if let Err(e) = bot.send_message(d, body.to_string()).await {
+            log::warn!("sip echo to {d}: {e}");
+        }
+    }
+}
+
+/// All user IDs known to belong to `chat` per `user_membership`.
+async fn membership_for_chat(
+    db: &crate::db::Db,
+    chat: ChatId,
+) -> std::collections::HashSet<UserId> {
+    let ids = db.users_in_chat(chat.0).await.unwrap_or_else(|e| {
+        log::warn!("users_in_chat({chat}): {e}");
+        Vec::new()
+    });
+    ids.into_iter().map(|i| UserId(i as u64)).collect()
+}
+
+async fn is_tea_aware(
+    db: &crate::db::Db,
+    chat: ChatId,
+    kind: &teloxide::types::ChatKind,
+) -> bool {
+    if matches!(kind, ChatKind::Private(_)) {
+        return true;
+    }
+    db.is_chat_tea_aware(chat.0).await.unwrap_or(false)
 }
 
 fn format_unix_short(unix_secs: i64) -> String {
@@ -3029,11 +3414,12 @@ async fn handle_nflake(
     Ok(())
 }
 
-// ---------- /cha gossip — cross-chat presence ----------
+// ---------- chat-membership tracking (cross-chat visibility) ----------
 
-/// Bump (user, chat) membership in the DB. Cheap upsert per incoming msg.
-/// Skipped for bots, for messages without a sender, and for private chats
-/// (where membership is just user→bot — not useful for cross-chat lookup).
+/// Upsert `(user_id, chat_id)` in `user_membership` on every inbound
+/// message. Skipped for bots and for messages without a sender. Includes
+/// private chats — DMs need to appear in `chats_for_user` so a DM-only
+/// participant's sip can land in their own DM.
 async fn track_membership(msg: &Message, config: &BotConfig) {
     let Some(from) = msg.from.as_ref() else {
         return;
@@ -3041,115 +3427,18 @@ async fn track_membership(msg: &Message, config: &BotConfig) {
     if from.is_bot {
         return;
     }
-    if matches!(msg.chat.kind, ChatKind::Private(_)) {
-        return;
-    }
-    let user_name = from
-        .username
-        .as_ref()
-        .map(|n| format!("@{n}"))
-        .unwrap_or_else(|| from.full_name());
+    let user_name = handle_display_name(from);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Err(e) = config
         .db
-        .bump_membership(from.id.0 as i64, msg.chat.id.0, user_name, now)
+        .touch_chat_member(from.id.0 as i64, msg.chat.id.0, user_name, now)
         .await
     {
-        log::warn!("bump_membership failed: {e}");
+        log::warn!("touch_chat_member failed: {e}");
     }
-}
-
-async fn cha_gossip(
-    bot: &Bot,
-    msg: &Message,
-    config: &BotConfig,
-    action: &str,
-) -> anyhow::Result<()> {
-    let Some(from) = msg.from.as_ref() else {
-        return Ok(());
-    };
-    let user_id = from.id.0 as i64;
-
-    match action {
-        "on" | "true" | "enable" | "yes" | "1" => {
-            if let Err(e) = config.db.gossip_set(user_id, true).await {
-                log::warn!("gossip_set on failed: {e}");
-            }
-            bot.send_message(msg.chat.id, "🍃 /cha gossip включён. ты теперь видимый.")
-                .reply_parameters(reply_params(msg))
-                .await?;
-            return Ok(());
-        }
-        "off" | "false" | "disable" | "no" | "0" => {
-            if let Err(e) = config.db.gossip_set(user_id, false).await {
-                log::warn!("gossip_set off failed: {e}");
-            }
-            bot.send_message(msg.chat.id, "🍃 /cha gossip выключен.")
-                .reply_parameters(reply_params(msg))
-                .await?;
-            return Ok(());
-        }
-        "" => {}
-        _ => {
-            bot.send_message(
-                msg.chat.id,
-                "формат: /cha gossip on|off (или /cha gossip — список)",
-            )
-            .reply_parameters(reply_params(msg))
-            .await?;
-            return Ok(());
-        }
-    }
-
-    // List mode — requires opt-in.
-    let opted_in = config.db.gossip_get(user_id).await.unwrap_or(false);
-    if !opted_in {
-        bot.send_message(
-            msg.chat.id,
-            "/cha gossip у тебя выключен. включить: /cha gossip on",
-        )
-        .reply_parameters(reply_params(msg))
-        .await?;
-        return Ok(());
-    }
-
-    let target_ids: std::collections::HashSet<i64> = match config.db.gossip_targets(user_id).await {
-        Ok(ids) => ids.into_iter().collect(),
-        Err(e) => {
-            log::warn!("gossip_targets failed: {e}");
-            std::collections::HashSet::new()
-        }
-    };
-
-    // Cross-reference against the in-memory session store.
-    let snapshot: Vec<(String, String, u32, std::time::Duration)> = {
-        let store = config.tea_sessions.lock().await;
-        store
-            .iter()
-            .filter(|((_, user), _)| target_ids.contains(&(user.0 as i64)))
-            .map(|(_, s)| (s.user_name.clone(), s.tea.clone(), s.steeps, s.idle_for()))
-            .collect()
-    };
-
-    let body = if snapshot.is_empty() {
-        "тихо :(".to_string()
-    } else {
-        let mut lines = vec!["\u{1F343} кто сейчас пьёт:".to_string()];
-        for (name, tea, steeps, idle) in snapshot {
-            lines.push(format!(
-                "  {name}, {tea}, {steeps} заварок, {ago}",
-                ago = crate::sessions::fmt_dur(idle)
-            ));
-        }
-        lines.join("\n")
-    };
-    bot.send_message(msg.chat.id, body)
-        .reply_parameters(reply_params(msg))
-        .await?;
-    Ok(())
 }
 
 // ---------- /typst, /latex, /math + ambient detectors ----------
@@ -3737,12 +4026,14 @@ async fn handle_file_inspect(
         return Ok(());
     };
 
-    // Telegram caps file downloads at 20 MB for bots; refuse early.
-    const MAX_BYTES: u32 = 20 * 1024 * 1024;
-    if size > MAX_BYTES {
+    if size > config.download_max_bytes {
+        let cap_mb = config.download_max_bytes / (1024 * 1024);
         bot.send_message(
             msg.chat.id,
-            format!("не ква, файл больше 20 МБ ({}), Telegram не даст скачать.", size),
+            format!(
+                "не ква, файл больше {} МБ ({}), скачать не получится.",
+                cap_mb, size
+            ),
         )
         .reply_parameters(reply_params(msg))
         .await?;

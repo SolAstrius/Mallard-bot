@@ -73,6 +73,14 @@ spec:
           env:
             - name: RUST_LOG
               value: "info"
+            # Local Bot API server raises the getFile cap to 2 GB. See
+            # deploy/tbot-api.yaml.
+            - name: TG_API_URL
+              value: "http://tbot-api.mallard.svc.cluster.local:8081"
+            - name: TG_DOWNLOAD_MAX_BYTES
+              # 2 GB — the upstream cap when going through a self-hosted
+              # Bot API server.
+              value: "2147483648"
           volumeMounts:
             - name: voices
               mountPath: /app/voices

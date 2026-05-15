@@ -27,7 +27,18 @@ async fn main() -> anyhow::Result<()> {
         .map(UserId);
 
     let mallard = Arc::new(Mutex::new(Mallard::new(150)));
-    let bot = Bot::new(token);
+    let mut bot = Bot::new(token);
+    // Optional: point at a self-hosted Bot API server (raises the 20 MB
+    // getFile cap to 2 GB). Set TG_API_URL=http://host:8081 in env.
+    if let Ok(api_url) = env::var("TG_API_URL") {
+        match reqwest::Url::parse(api_url.trim_end_matches('/')) {
+            Ok(url) => {
+                log::info!("using custom Bot API at {url}");
+                bot = bot.set_api_url(url);
+            }
+            Err(e) => log::warn!("TG_API_URL set but unparseable ({e}); using default api.telegram.org"),
+        }
+    }
 
     let me = bot.get_me().await?;
     let bot_username = me
@@ -82,17 +93,25 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("open db {db_path}: {e}"))?;
     log::info!("db open at {db_path}");
 
-    let tea_sessions = new_store();
-    spawn_reaper(tea_sessions.clone(), db.clone());
+    let chabani = new_store();
+    spawn_reaper(chabani.clone(), db.clone());
     nixsearch::spawn_refresher(db.clone());
     mallard_bot::fx::spawn_refresher();
+
+    // Hosted Bot API caps getFile at 20 MB; self-hosted goes up to 2 GB.
+    // Configurable via env so the manifest can opt into the higher limit.
+    let download_max_bytes: u32 = env::var("TG_DOWNLOAD_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(20 * 1024 * 1024);
 
     let config = BotConfig {
         admin_id,
         pack,
         db,
-        tea_sessions,
+        chabani,
         bot_username: bot_username.clone(),
+        download_max_bytes,
     };
 
     build_dispatcher(bot, mallard, config).dispatch().await;

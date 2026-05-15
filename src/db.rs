@@ -53,6 +53,8 @@ fn migrate_chat_features_to_typed(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 const SCHEMA: &str = "
+-- Legacy per-(chat,user) session log. Untouched by current code; kept so
+-- deployed databases stay loadable. The active log is `cha_chabani` below.
 CREATE TABLE IF NOT EXISTS cha_sessions (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id      INTEGER NOT NULL,
@@ -67,8 +69,36 @@ CREATE TABLE IF NOT EXISTS cha_sessions (
     notes        TEXT    NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_cha_chat_ended
-    ON cha_sessions(chat_id, ended_at DESC);
+-- A closed chabani — the unit of the redesigned tea subsystem. One row per
+-- *teapot* (not per participant); participants live in the JSON column so we
+-- don't denormalize a shared object across N rows. `notes` is an array of
+-- `{u: user_id, t: text}` records attributing each note to its author.
+-- `origin_chat_id` is the chat where the chabani was first opened.
+CREATE TABLE IF NOT EXISTS cha_chabani (
+    id              TEXT    PRIMARY KEY,
+    label           TEXT    NOT NULL,
+    origin_chat_id  INTEGER NOT NULL,
+    started_at      INTEGER NOT NULL,
+    ended_at        INTEGER NOT NULL,
+    duration_s      INTEGER NOT NULL,
+    sips            INTEGER NOT NULL,
+    auto_closed     INTEGER NOT NULL,
+    notes           TEXT    NOT NULL,
+    participants    TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cha_chabani_chat_ended
+    ON cha_chabani(origin_chat_id, ended_at DESC);
+
+-- Per-chat tea visibility. Off by default — the bot only surfaces a chat's
+-- chabani events to outside observers (via `/cha world` and `/sip` echo)
+-- when the chat has explicitly opted in. DMs are treated as always-on at
+-- the handler layer.
+CREATE TABLE IF NOT EXISTS cha_chat_settings (
+    chat_id   INTEGER PRIMARY KEY,
+    tea_aware INTEGER NOT NULL DEFAULT 0,
+    set_at    INTEGER NOT NULL
+);
 
 -- Nixpkgs / NixOS options local catalog. Populated by a background task
 -- that downloads channels.nixos.org snapshots. FTS5 for query-time search.
@@ -136,9 +166,10 @@ CREATE TABLE IF NOT EXISTS chat_features (
     PRIMARY KEY (chat_id, feature)
 );
 
--- (user, chat) presence map populated from any message we see. Powers
--- /cha gossip's 'we share a chat' lookup. `last_seen` lets future code
--- threshold out long-dormant memberships.
+-- (user, chat) presence map populated from any message we see. Drives
+-- `/cha world` (which chats a participant is in) and the `/sip` echo
+-- fan-out (which chats receive a sip announcement). `last_seen` lets
+-- future code threshold out long-dormant memberships.
 CREATE TABLE IF NOT EXISTS user_membership (
     user_id   INTEGER NOT NULL,
     chat_id   INTEGER NOT NULL,
@@ -147,8 +178,12 @@ CREATE TABLE IF NOT EXISTS user_membership (
     PRIMARY KEY (user_id, chat_id)
 );
 
--- Per-user opt-in for cross-chat tea presence. Mutual: you only see opted-in
--- users; you only appear in others' lists if you're opted in yourself.
+CREATE INDEX IF NOT EXISTS idx_user_membership_user
+    ON user_membership(user_id);
+
+-- Legacy per-user opt-in for the original gossip prototype. No longer read
+-- or written; replaced by per-chat `cha_chat_settings.tea_aware`. Kept so
+-- deployed databases stay loadable.
 CREATE TABLE IF NOT EXISTS cha_gossip_optin (
     user_id INTEGER PRIMARY KEY,
     enabled INTEGER NOT NULL
@@ -156,14 +191,18 @@ CREATE TABLE IF NOT EXISTS cha_gossip_optin (
 ";
 
 #[derive(Debug, Clone)]
-pub struct ChaLogRow {
-    pub user_name: String,
-    pub tea: String,
+pub struct ChabaniRow {
+    pub id: String,
+    pub label: String,
+    pub origin_chat_id: i64,
     pub started_at: i64,
     pub duration_s: i64,
-    pub steeps: i64,
+    pub sips: i64,
     pub auto_closed: bool,
+    /// JSON array `[{u:user_id, t:"text"}, ...]` — note author + body.
     pub notes_json: String,
+    /// JSON array `[{u:user_id, n:"name", c:chat_id}, ...]` — frozen at close.
+    pub participants_json: String,
 }
 
 impl Db {
@@ -181,40 +220,41 @@ impl Db {
         })
     }
 
-    /// Insert a closed cha session.
+    /// Persist a closed chabani. One row per teapot — participants and notes
+    /// are JSON columns (see [`ChabaniRow`] for the shape).
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_cha_session(
+    pub async fn insert_chabani(
         &self,
-        chat_id: i64,
-        user_id: i64,
-        user_name: String,
-        tea: String,
+        id: String,
+        label: String,
+        origin_chat_id: i64,
         started_at: i64,
         ended_at: i64,
         duration_s: i64,
-        steeps: i64,
+        sips: i64,
         auto_closed: bool,
         notes_json: String,
+        participants_json: String,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO cha_sessions
-                 (chat_id, user_id, user_name, tea, started_at, ended_at,
-                  duration_s, steeps, auto_closed, notes)
+                "INSERT INTO cha_chabani
+                 (id, label, origin_chat_id, started_at, ended_at,
+                  duration_s, sips, auto_closed, notes, participants)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
-                    chat_id,
-                    user_id,
-                    user_name,
-                    tea,
+                    id,
+                    label,
+                    origin_chat_id,
                     started_at,
                     ended_at,
                     duration_s,
-                    steeps,
+                    sips,
                     if auto_closed { 1 } else { 0 },
                     notes_json,
+                    participants_json,
                 ],
             )?;
             Ok::<_, rusqlite::Error>(())
@@ -223,28 +263,37 @@ impl Db {
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
 
-    /// Fetch the most recent `limit` closed sessions for a chat, newest first.
-    pub async fn tail_cha_log(&self, chat_id: i64, limit: i64) -> rusqlite::Result<Vec<ChaLogRow>> {
+    /// Most recent `limit` closed chabani for a chat, newest first. Scoped to
+    /// the chabani's *origin* chat — a chabani started in chat A and joined
+    /// from chat B shows up in A's `/cha last`, not B's.
+    pub async fn tail_chabani_by_origin(
+        &self,
+        chat_id: i64,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<ChabaniRow>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn.prepare(
-                "SELECT user_name, tea, started_at, duration_s, steeps, auto_closed, notes
-                 FROM cha_sessions
-                 WHERE chat_id = ?1
+                "SELECT id, label, origin_chat_id, started_at, duration_s,
+                        sips, auto_closed, notes, participants
+                 FROM cha_chabani
+                 WHERE origin_chat_id = ?1
                  ORDER BY ended_at DESC
                  LIMIT ?2",
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![chat_id, limit], |row| {
-                    Ok(ChaLogRow {
-                        user_name: row.get(0)?,
-                        tea: row.get(1)?,
-                        started_at: row.get(2)?,
-                        duration_s: row.get(3)?,
-                        steeps: row.get(4)?,
-                        auto_closed: row.get::<_, i64>(5)? != 0,
-                        notes_json: row.get(6)?,
+                    Ok(ChabaniRow {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        origin_chat_id: row.get(2)?,
+                        started_at: row.get(3)?,
+                        duration_s: row.get(4)?,
+                        sips: row.get(5)?,
+                        auto_closed: row.get::<_, i64>(6)? != 0,
+                        notes_json: row.get(7)?,
+                        participants_json: row.get(8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -680,10 +729,13 @@ impl Db {
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
 
-    // ---------- gossip (cross-chat tea presence) ----------
+    // ---------- chat membership + per-chat tea visibility ----------
 
-    /// Upsert a row in `user_membership` — bumped on every incoming message.
-    pub async fn bump_membership(
+    /// Upsert `(user_id, chat_id)` in `user_membership`. Called from every
+    /// inbound message — drives the `chats_for_user` lookup that fans out
+    /// `/sip` echoes and the `/cha world` visibility join. Best-effort:
+    /// callers log-and-continue on error.
+    pub async fn touch_chat_member(
         &self,
         user_id: i64,
         chat_id: i64,
@@ -707,16 +759,77 @@ impl Db {
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
 
-    pub async fn gossip_get(&self, user_id: i64) -> rusqlite::Result<bool> {
+    /// All user IDs known to belong to `chat_id` per the membership map.
+    /// Used by `/cha here` to figure out which participants of a live
+    /// chabani are "in this chat" for display.
+    pub async fn users_in_chat(&self, chat_id: i64) -> rusqlite::Result<Vec<i64>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt =
-                conn.prepare("SELECT enabled FROM cha_gossip_optin WHERE user_id = ?1")?;
-            let mut rows = stmt.query(rusqlite::params![user_id])?;
+                conn.prepare("SELECT user_id FROM user_membership WHERE chat_id = ?1")?;
+            let rows = stmt
+                .query_map(rusqlite::params![chat_id], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// All chat IDs the user has been seen in. Used as the "rooms this
+    /// participant is in" set when computing `/sip` echo destinations.
+    pub async fn chats_for_user(&self, user_id: i64) -> rusqlite::Result<Vec<i64>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt =
+                conn.prepare("SELECT chat_id FROM user_membership WHERE user_id = ?1")?;
+            let rows = stmt
+                .query_map(rusqlite::params![user_id], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, rusqlite::Error>(rows)
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Toggle a chat's `tea_aware` flag. `on=true` adds the chat to the
+    /// `/sip` echo destination set and makes its chabani visible via
+    /// `/cha world` in other tea-aware chats.
+    pub async fn set_chat_tea_aware(&self, chat_id: i64, on: bool) -> rusqlite::Result<()> {
+        let conn = self.conn.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO cha_chat_settings(chat_id, tea_aware, set_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                     tea_aware = excluded.tea_aware,
+                     set_at    = excluded.set_at",
+                rusqlite::params![chat_id, if on { 1 } else { 0 }, now],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    }
+
+    /// Returns `false` when no row exists. Group chats are off by default;
+    /// the handler layer treats DMs as implicitly on.
+    pub async fn is_chat_tea_aware(&self, chat_id: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt =
+                conn.prepare("SELECT tea_aware FROM cha_chat_settings WHERE chat_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![chat_id])?;
             if let Some(row) = rows.next()? {
-                let v: i64 = row.get(0)?;
-                Ok::<_, rusqlite::Error>(v != 0)
+                Ok::<_, rusqlite::Error>(row.get::<_, i64>(0)? != 0)
             } else {
                 Ok(false)
             }
@@ -725,39 +838,17 @@ impl Db {
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
     }
 
-    pub async fn gossip_set(&self, user_id: i64, enabled: bool) -> rusqlite::Result<()> {
+    /// Set of chat IDs with `tea_aware = 1`. Cached at the call site for the
+    /// duration of one echo fan-out / visibility query.
+    pub async fn tea_aware_chats(&self) -> rusqlite::Result<std::collections::HashSet<i64>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute(
-                "INSERT INTO cha_gossip_optin(user_id, enabled) VALUES(?1, ?2)
-                 ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled",
-                rusqlite::params![user_id, if enabled { 1 } else { 0 }],
-            )?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-    }
-
-    /// User IDs of opted-in users who share at least one chat with `asker`.
-    pub async fn gossip_targets(&self, asker: i64) -> rusqlite::Result<Vec<i64>> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT m_other.user_id
-                 FROM   user_membership m_self
-                 JOIN   user_membership m_other
-                        ON m_self.chat_id = m_other.chat_id
-                       AND m_other.user_id <> m_self.user_id
-                 WHERE  m_self.user_id = ?1
-                   AND  m_other.user_id IN
-                        (SELECT user_id FROM cha_gossip_optin WHERE enabled = 1)",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT chat_id FROM cha_chat_settings WHERE tea_aware = 1")?;
             let rows = stmt
-                .query_map(rusqlite::params![asker], |row| row.get::<_, i64>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<std::collections::HashSet<_>, _>>()?;
             Ok::<_, rusqlite::Error>(rows)
         })
         .await
