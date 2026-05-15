@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use rand::Rng;
-use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatId, ChatKind, FileId, InlineQueryResult, InlineQueryResultArticle,
@@ -461,9 +460,25 @@ fn describe_media(reply: &Message) -> &'static str {
 
 async fn download_file(bot: &Bot, file_id: FileId) -> anyhow::Result<Vec<u8>> {
     let file = bot.get_file(file_id).await?;
-    let mut buf = Vec::with_capacity(file.size as usize);
-    bot.download_file(&file.path, &mut buf).await?;
-    Ok(buf)
+    // teloxide's `download_file` builds the URL via `path_segments_mut().push`,
+    // which percent-encodes every `/` inside `file.path` to `%2F`. The hosted
+    // api.telegram.org happens to normalize that back, but the self-hosted
+    // telegram-bot-api (Boost HTTP server) treats `%2F` as a literal byte and
+    // 404s. Build the URL manually with raw slashes so both work.
+    let base = bot.api_url();
+    let token = bot.token();
+    let base_str = base.as_str().trim_end_matches('/');
+    let url = format!("{base_str}/file/bot{token}/{}", file.path);
+    let resp = bot.client().get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "download {} → HTTP {}",
+            file.path,
+            resp.status()
+        ));
+    }
+    let bytes = resp.bytes().await?;
+    Ok(bytes.to_vec())
 }
 
 async fn handle_text(
