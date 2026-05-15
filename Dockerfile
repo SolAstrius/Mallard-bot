@@ -10,6 +10,7 @@ RUN apt-get update \
         build-essential \
         m4 \
         pkg-config \
+        libfontconfig1-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -39,6 +40,7 @@ RUN apt-get update \
         curl \
         ffmpeg \
         xz-utils \
+        libfontconfig1 \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL -o /tmp/typst.tar.xz \
         "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz" \

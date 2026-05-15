@@ -322,7 +322,7 @@ pub async fn resolve_upstream_arg(arg: &str) -> Result<IpAddr, String> {
             // try v6 fallback
             None::<IpAddr>
         })
-        .ok_or_else(|| format!("не нашёл резолвер {arg:?}"))
+        .ok_or_else(|| format!("не нашла резолвер {arg:?}"))
 }
 
 /// Translate a user-supplied type token into a `RecordType`. Defaults to
@@ -1029,7 +1029,7 @@ async fn cmd_spf(tokens: &[&str], rules: &[(String, String)]) -> String {
 
     let mut out = format!("; SPF {}\n", domain);
     if tree.is_empty() {
-        out.push_str("; не нашёл v=spf1 TXT\n");
+        out.push_str("; не нашла v=spf1 TXT\n");
         return out;
     }
     out.push_str(&tree.join("\n"));

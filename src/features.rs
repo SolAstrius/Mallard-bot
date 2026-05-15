@@ -147,6 +147,10 @@ pub const FEATURES: &[FeatureDef] = &[
     FeatureDef { path: "dns.show_ttl",         default: "on",   ty: TypeSpec::Bool },
     FeatureDef { path: "dns.show_rtt",         default: "on",   ty: TypeSpec::Bool },
     FeatureDef { path: "dns.parallel_timeout", default: "3000", ty: TypeSpec::Int { min: 500, max: 10000 } },
+
+    // ---- /file, /binwalk, /exif ----
+    FeatureDef { path: "util.file", default: "on", ty: TypeSpec::Bool },
+    FeatureDef { path: "util.exif", default: "on", ty: TypeSpec::Bool },
 ];
 
 pub fn def_of(flag: &str) -> Option<&'static FeatureDef> {

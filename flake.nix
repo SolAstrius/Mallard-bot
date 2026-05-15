@@ -31,6 +31,8 @@
             # Build-time helpers for crates that probe the environment.
             pkg-config
             cmake
+            # binwalk → plotters → font-kit links against fontconfig.
+            fontconfig
           ];
 
           buildInputs = runtimeLibs;

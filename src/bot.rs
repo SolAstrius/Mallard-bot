@@ -94,6 +94,12 @@ pub enum Command {
     Plot(String),
     #[command(description = "DNS-тулчейн: /dns <name>, /dns prop, /dns mx, /dns dmarc, /dns help")]
     Dns(String),
+    #[command(description = "анализ файла в ответ: /file (magic + sha256 + binwalk-сводка)")]
+    File,
+    #[command(description = "полный binwalk на файл в ответ: /binwalk")]
+    Binwalk,
+    #[command(description = "EXIF / метаданные файла в ответ: /exif")]
+    Exif,
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -302,6 +308,15 @@ const HELP_FEATURE: &str = "/feature — управление флагами к�
 Значения, не подходящие под тип конкретного флага (например `endswith` на bool-флаге), будут проигнорированы при чтении — wildcard-правило с bool-значением не сломает соседний enum-флаг.\n\
 кря-кря.";
 
+const HELP_FILE: &str = "/file, /binwalk, /exif — анализ файла из ответа.\n\
+Запускаются ответом на сообщение с вложением: фото, документ, видео, стикер, голос, аудио, гифка или кружок.\n\
+* /file — magic-bytes MIME, размер, sha256, формат, краткая сводка binwalk (если что-то вложено).\n\
+* /binwalk — полный binwalk-скан, все сигнатуры со смещениями.\n\
+* /exif — все EXIF-поля файла (GPS, серийники камеры, время съёмки и т.п.).\n\
+Лимит Telegram — 20 МБ на скачивание; больше — не получится.\n\
+Сканирование чисто in-memory: ничего никуда не извлекается.\n\
+кря-кря.";
+
 const HELP_DNS: &str = "/dns — DNS-тулчейн для sysadmin'ов.\n\
 Подкоманды:\n\
 * /dns <name> [type] [@resolver] — обычный lookup. Тип по умолчанию — A. Резолвер — первый из dns.resolvers.* или конкретная IP/хост через @.\n\
@@ -360,6 +375,7 @@ fn help_for(query: &str) -> String {
         "sym" => HELP_SYM.to_string(),
         "plot" => HELP_PLOT.to_string(),
         "dns" => HELP_DNS.to_string(),
+        "file" | "binwalk" | "exif" => HELP_FILE.to_string(),
         "theme" | "dark" => HELP_THEME.to_string(),
         other => format!(
             "Не ква, не знаю такой команды ({other:?}). \
@@ -649,6 +665,9 @@ async fn handle_command(
         Command::Sym(r) => format!("sym {r}").trim().to_string(),
         Command::Plot(r) => format!("plot {r}").trim().to_string(),
         Command::Dns(r) => format!("dns {r}").trim().to_string(),
+        Command::File => "file".to_string(),
+        Command::Binwalk => "binwalk".to_string(),
+        Command::Exif => "exif".to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -691,6 +710,9 @@ async fn handle_command(
         Command::Sym(rest) => handle_sym(&bot, &msg, &rest, &config).await,
         Command::Plot(rest) => handle_plot(&bot, &msg, &rest, &config).await,
         Command::Dns(rest) => handle_dns(&bot, &msg, &rest, &config).await,
+        Command::File => handle_file_inspect(&bot, &msg, &config, FileInspect::Summary).await,
+        Command::Binwalk => handle_file_inspect(&bot, &msg, &config, FileInspect::Binwalk).await,
+        Command::Exif => handle_file_inspect(&bot, &msg, &config, FileInspect::Exif).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -3665,6 +3687,159 @@ async fn handle_dns(
         .reply_parameters(reply_params(msg))
         .await?;
     Ok(())
+}
+
+// ---------- /file, /binwalk, /exif — attachment introspection ----------
+
+#[derive(Clone, Copy)]
+enum FileInspect {
+    Summary,
+    Binwalk,
+    Exif,
+}
+
+impl FileInspect {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Summary => "util.file",
+            Self::Binwalk => "util.file",
+            Self::Exif => "util.exif",
+        }
+    }
+}
+
+async fn handle_file_inspect(
+    bot: &Bot,
+    msg: &Message,
+    config: &BotConfig,
+    mode: FileInspect,
+) -> anyhow::Result<()> {
+    if !is_feature_enabled(config, msg.chat.id, mode.flag()).await {
+        return Ok(());
+    }
+    let Some(reply) = msg.reply_to_message() else {
+        bot.send_message(
+            msg.chat.id,
+            "не ква, нужно ответом на файл/картинку/видео/стикер.",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    };
+
+    let Some((file_id, label, size)) = extract_attachment(reply) else {
+        bot.send_message(
+            msg.chat.id,
+            "не ква, в ответе нет ничего, что можно скачать.",
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    };
+
+    // Telegram caps file downloads at 20 MB for bots; refuse early.
+    const MAX_BYTES: u32 = 20 * 1024 * 1024;
+    if size > MAX_BYTES {
+        bot.send_message(
+            msg.chat.id,
+            format!("не ква, файл больше 20 МБ ({}), Telegram не даст скачать.", size),
+        )
+        .reply_parameters(reply_params(msg))
+        .await?;
+        return Ok(());
+    }
+
+    let bytes = match download_file(bot, file_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("file download failed: {e}");
+            bot.send_message(msg.chat.id, format!("не ква, не получилось скачать: {e}"))
+                .reply_parameters(reply_params(msg))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // The actual analysis is CPU-bound (binwalk in particular scans
+    // hundreds of signatures). Offload off the runtime worker.
+    let label_clone = label.clone();
+    let body = tokio::task::spawn_blocking(move || match mode {
+        FileInspect::Summary => {
+            let info = crate::file_tools::analyze(&bytes);
+            crate::file_tools::format_file_report(Some(&label_clone), &info)
+        }
+        FileInspect::Binwalk => {
+            crate::file_tools::format_binwalk_full(Some(&label_clone), &bytes)
+        }
+        FileInspect::Exif => crate::file_tools::format_exif(Some(&label_clone), &bytes),
+    })
+    .await
+    .unwrap_or_else(|e| format!("спавн анализа сломался: {e}"));
+
+    let formatted = format!(
+        "<pre>{}</pre>",
+        html_escape(&truncate_chars(body.trim_end(), 3800))
+    );
+    bot.send_message(msg.chat.id, formatted)
+        .parse_mode(ParseMode::Html)
+        .reply_parameters(reply_params(msg))
+        .await?;
+    Ok(())
+}
+
+/// Pull (file_id, label, size) out of any media kind on a replied message
+/// that the bot can download. Label is for the report header: original
+/// filename for documents, "photo"/"video"/"sticker"/etc. otherwise.
+fn extract_attachment(msg: &Message) -> Option<(FileId, String, u32)> {
+    let MessageKind::Common(common) = &msg.kind else {
+        return None;
+    };
+    match &common.media_kind {
+        MediaKind::Photo(p) => {
+            let best = p.photo.last()?;
+            Some((best.file.id.clone(), "photo".to_string(), best.file.size))
+        }
+        MediaKind::Document(d) => {
+            let name = d
+                .document
+                .file_name
+                .clone()
+                .unwrap_or_else(|| "document".to_string());
+            Some((d.document.file.id.clone(), name, d.document.file.size))
+        }
+        MediaKind::Video(v) => {
+            let name = v
+                .video
+                .file_name
+                .clone()
+                .unwrap_or_else(|| "video".to_string());
+            Some((v.video.file.id.clone(), name, v.video.file.size))
+        }
+        MediaKind::VideoNote(vn) => Some((
+            vn.video_note.file.id.clone(),
+            "video_note".to_string(),
+            vn.video_note.file.size,
+        )),
+        MediaKind::Animation(a) => {
+            let name = a
+                .animation
+                .file_name
+                .clone()
+                .unwrap_or_else(|| "animation".to_string());
+            Some((a.animation.file.id.clone(), name, a.animation.file.size))
+        }
+        MediaKind::Audio(a) => {
+            let name = a
+                .audio
+                .file_name
+                .clone()
+                .unwrap_or_else(|| "audio".to_string());
+            Some((a.audio.file.id.clone(), name, a.audio.file.size))
+        }
+        MediaKind::Voice(v) => Some((v.voice.file.id.clone(), "voice".to_string(), v.voice.file.size)),
+        MediaKind::Sticker(s) => Some((s.sticker.file.id.clone(), "sticker".to_string(), s.sticker.file.size)),
+        _ => None,
+    }
 }
 
 // ---------- /sym — symbolica CAS ----------
