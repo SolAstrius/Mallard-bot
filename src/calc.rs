@@ -9,6 +9,8 @@
 //! call is independent (no carry-over of `let` bindings across messages),
 //! matching Mallard's stateless contract.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rand::Rng;
@@ -16,6 +18,18 @@ use rand::Rng;
 /// Used by fend for `roll d6`, `random`, etc.
 fn rand_u32() -> u32 {
     rand::thread_rng().gen()
+}
+
+/// Lets the timeout timer cancel a fend evaluation mid-computation.
+/// Without this, `tokio::time::timeout` only stops awaiting the worker —
+/// fend keeps churning on adversarial inputs like `2 ^ 2 ^ 1000` until
+/// it spontaneously finishes or the process dies.
+struct TimeoutInterrupt(Arc<AtomicBool>);
+
+impl fend_core::Interrupt for TimeoutInterrupt {
+    fn should_interrupt(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug)]
@@ -77,6 +91,18 @@ pub async fn evaluate(expr: &str, opts: &CalcOpts) -> Result<String, CalcError> 
     // Capture wall-clock time before crossing to the blocking pool so the
     // worker doesn't need to query the system clock itself.
     let ms_since_epoch = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+    // Interrupt flag flipped to `true` by the timeout timer; fend polls it
+    // mid-evaluation and returns `Err("interrupted")` cleanly.
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    let timer_flag = Arc::clone(&interrupt_flag);
+    let timeout = opts.timeout;
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        timer_flag.store(true, Ordering::Relaxed);
+    });
+
+    let worker_flag = Arc::clone(&interrupt_flag);
     let work = tokio::task::spawn_blocking(move || {
         let mut ctx = fend_core::Context::new();
         // Without this, fend errors on `today` / `now` / date arithmetic.
@@ -85,17 +111,21 @@ pub async fn evaluate(expr: &str, opts: &CalcOpts) -> Result<String, CalcError> 
         ctx.set_current_time_v1(ms_since_epoch, 0);
         // Wire the RNG so `roll d6` and friends inside fend work.
         ctx.set_random_u32_fn(rand_u32);
-        match fend_core::evaluate(&owned, &mut ctx) {
+        let interrupt = TimeoutInterrupt(worker_flag);
+        match fend_core::evaluate_with_interrupt(&owned, &mut ctx, &interrupt) {
             Ok(r) => Ok(r.get_main_result().to_string()),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e),
         }
     });
 
-    match tokio::time::timeout(opts.timeout, work).await {
-        Ok(Ok(Ok(s))) => Ok(s),
-        Ok(Ok(Err(msg))) => Err(CalcError::Eval(msg)),
-        Ok(Err(join_err)) => Err(CalcError::Eval(format!("worker panic: {join_err}"))),
-        Err(_) => Err(CalcError::Timeout),
+    let outcome = work.await;
+    timer.abort(); // free the timer task if the worker finished first
+
+    match outcome {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(msg)) if msg == "interrupted" => Err(CalcError::Timeout),
+        Ok(Err(msg)) => Err(CalcError::Eval(msg)),
+        Err(join_err) => Err(CalcError::Eval(format!("worker panic: {join_err}"))),
     }
 }
 
