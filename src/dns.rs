@@ -287,7 +287,7 @@ pub async fn query_at(
             let msg = if e.is_nx_domain() {
                 "NXDOMAIN".to_string()
             } else if e.is_no_records_found() {
-                "no records".to_string()
+                "нет записей".to_string()
             } else {
                 e.to_string()
             };
@@ -1306,7 +1306,7 @@ async fn probe_starttls(host: &str, timeout: Duration) -> Result<String, String>
     let target = format!("{host}:25");
     let stream = tokio::time::timeout(timeout, TcpStream::connect(&target))
         .await
-        .map_err(|_| "TCP timeout".to_string())?
+        .map_err(|_| "TCP timeout (нет ответа)".to_string())?
         .map_err(|e| classify_tcp_error(&e))?;
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
@@ -1359,7 +1359,7 @@ async fn probe_starttls(host: &str, timeout: Duration) -> Result<String, String>
 
     let tls = tokio::time::timeout(timeout, connector.connect(server_name, socket))
         .await
-        .map_err(|_| "TLS timeout".to_string())?
+        .map_err(|_| "TLS timeout (хэндшейк завис)".to_string())?
         .map_err(|e| format!("TLS handshake: {e}"))?;
     let (_io, conn) = tls.into_inner();
     let certs = conn
@@ -1389,9 +1389,9 @@ fn classify_tcp_error(e: &std::io::Error) -> String {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::ConnectionRefused => "TCP refused (порт 25 закрыт)".to_string(),
-        ErrorKind::TimedOut => "TCP timeout".to_string(),
-        _ if e.raw_os_error() == Some(101) => "TCP: network unreachable".to_string(),
-        _ if e.raw_os_error() == Some(113) => "TCP: no route to host".to_string(),
+        ErrorKind::TimedOut => "TCP timeout (порт 25 не отвечает)".to_string(),
+        _ if e.raw_os_error() == Some(101) => "TCP: сеть недоступна".to_string(),
+        _ if e.raw_os_error() == Some(113) => "TCP: маршрута до хоста нет".to_string(),
         _ => format!("TCP: {e}"),
     }
 }

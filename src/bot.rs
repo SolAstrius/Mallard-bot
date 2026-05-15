@@ -72,7 +72,7 @@ pub enum Command {
     Nixwhere(String),
     #[command(description = "ревизия канала: /nchan [nixos-unstable]")]
     Nchan(String),
-    #[command(description = "flake registry: /nflake nixpkgs")]
+    #[command(description = "найти flake в реестре: /nflake nixpkgs")]
     Nflake(String),
     #[command(description = "флаги в чате: /feature, /feature <шаблон> on|off|reset (для админов)")]
     Feature(String),
@@ -1089,7 +1089,7 @@ async fn handle_voice(
     }
     let name = rest.split_whitespace().next().unwrap_or("").trim();
     if name.is_empty() {
-        bot.send_message(msg.chat.id, "Usage: /voice <name>")
+        bot.send_message(msg.chat.id, "формат: /voice <имя>")
             .reply_parameters(reply_params(msg))
             .await?;
         return Ok(());
