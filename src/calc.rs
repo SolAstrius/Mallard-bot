@@ -11,6 +11,13 @@
 
 use std::time::Duration;
 
+use rand::Rng;
+
+/// Used by fend for `roll d6`, `random`, etc.
+fn rand_u32() -> u32 {
+    rand::thread_rng().gen()
+}
+
 #[derive(Debug)]
 pub enum CalcError {
     Empty,
@@ -67,8 +74,17 @@ pub async fn evaluate(expr: &str, opts: &CalcOpts) -> Result<String, CalcError> 
     }
 
     let owned = trimmed.to_string();
+    // Capture wall-clock time before crossing to the blocking pool so the
+    // worker doesn't need to query the system clock itself.
+    let ms_since_epoch = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let work = tokio::task::spawn_blocking(move || {
         let mut ctx = fend_core::Context::new();
+        // Without this, fend errors on `today` / `now` / date arithmetic.
+        // TZ offset stays 0 (UTC); users can write `now to Europe/Moscow`
+        // etc. when they want a specific zone.
+        ctx.set_current_time_v1(ms_since_epoch, 0);
+        // Wire the RNG so `roll d6` and friends inside fend work.
+        ctx.set_random_u32_fn(rand_u32);
         match fend_core::evaluate(&owned, &mut ctx) {
             Ok(r) => Ok(r.get_main_result().to_string()),
             Err(e) => Err(e.to_string()),
