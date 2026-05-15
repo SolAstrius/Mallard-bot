@@ -36,11 +36,13 @@ spec:
         - name: api
           image: aiogram/telegram-bot-api:latest
           imagePullPolicy: IfNotPresent
-          # --local: makes getFile return absolute filesystem paths and
-          # disables the 20 MB download cap. Bot pod reads files directly
-          # from the shared volume.
-          args: ["--local"]
           env:
+            # TELEGRAM_LOCAL=1 → entrypoint passes --local to the server,
+            # making getFile return absolute filesystem paths and disabling
+            # the 20 MB download cap. Bot pod reads files directly from the
+            # shared volume.
+            - name: TELEGRAM_LOCAL
+              value: "1"
             - name: TELEGRAM_API_ID
               valueFrom:
                 secretKeyRef:
