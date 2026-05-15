@@ -1,0 +1,108 @@
+# Local Telegram Bot API server.
+# Bypasses the 20 MB download cap that api.telegram.org enforces — with
+# this in front of the bot, getFile can pull files up to 2 GB.
+#
+# Credentials: api_id + api_hash come from https://my.telegram.org/apps
+# (one-time, per Telegram account). Inject out-of-band:
+#
+#   kubectl -n mallard create secret generic tbot-api-creds \
+#     --from-literal=TELEGRAM_API_ID=<id> \
+#     --from-literal=TELEGRAM_API_HASH=<hash> \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# The pod will CrashLoopBackOff until both keys are present in the secret.
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tbot-api-data
+  namespace: mallard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: openebs-zfs
+  resources:
+    requests:
+      # Cached files live here; size to taste. Telegram bots can also
+      # auto-evict cached files via `deleteFile`.
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tbot-api
+  namespace: mallard
+  labels:
+    app: tbot-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tbot-api
+  template:
+    metadata:
+      labels:
+        app: tbot-api
+    spec:
+      containers:
+        - name: api
+          image: aiogram/telegram-bot-api:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TELEGRAM_API_ID
+              valueFrom:
+                secretKeyRef:
+                  name: tbot-api-creds
+                  key: TELEGRAM_API_ID
+            - name: TELEGRAM_API_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: tbot-api-creds
+                  key: TELEGRAM_API_HASH
+            - name: TELEGRAM_STAT
+              value: "1"
+            - name: TELEGRAM_VERBOSITY
+              value: "1"
+          ports:
+            - containerPort: 8081
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/telegram-bot-api
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tbot-api-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tbot-api
+  namespace: mallard
+spec:
+  type: ClusterIP
+  selector:
+    app: tbot-api
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: http
