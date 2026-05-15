@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let tea_sessions = new_store();
     spawn_reaper(tea_sessions.clone(), db.clone());
     nixsearch::spawn_refresher(db.clone());
+    mallard_bot::fx::spawn_refresher();
 
     let config = BotConfig {
         admin_id,

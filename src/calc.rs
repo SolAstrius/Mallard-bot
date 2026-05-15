@@ -103,6 +103,7 @@ pub async fn evaluate(expr: &str, opts: &CalcOpts) -> Result<String, CalcError> 
     });
 
     let worker_flag = Arc::clone(&interrupt_flag);
+    let fx_provider = crate::fx::provider();
     let work = tokio::task::spawn_blocking(move || {
         let mut ctx = fend_core::Context::new();
         // Without this, fend errors on `today` / `now` / date arithmetic.
@@ -111,6 +112,10 @@ pub async fn evaluate(expr: &str, opts: &CalcOpts) -> Result<String, CalcError> 
         ctx.set_current_time_v1(ms_since_epoch, 0);
         // Wire the RNG so `roll d6` and friends inside fend work.
         ctx.set_random_u32_fn(rand_u32);
+        // Currency conversion: cache populated by background refresher.
+        ctx.set_exchange_rate_handler_v2(crate::fx::FendRateHandler {
+            provider: fx_provider,
+        });
         let interrupt = TimeoutInterrupt(worker_flag);
         match fend_core::evaluate_with_interrupt(&owned, &mut ctx, &interrupt) {
             Ok(r) => Ok(r.get_main_result().to_string()),

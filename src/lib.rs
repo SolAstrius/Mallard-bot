@@ -7,6 +7,7 @@ pub mod dictionaries;
 pub mod dns;
 pub mod exceptions;
 pub mod file_tools;
+pub mod fx;
 pub mod features;
 pub mod math;
 pub mod imaging;
