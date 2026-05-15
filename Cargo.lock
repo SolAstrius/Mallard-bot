@@ -167,7 +167,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eb93bbb63b9c227414f6eb3a0adfddca591a8ce1e9b60661bb08969b87e340b"
 dependencies = [
- "object",
+ "object 0.37.3",
 ]
 
 [[package]]
@@ -383,6 +383,26 @@ dependencies = [
  "pest",
  "pest_derive",
  "rand 0.8.6",
+]
+
+[[package]]
+name = "capstone"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "015ef5d5ca1743e3f94af9509ba6bd2886523cfee46e48d15c2ef5216fd4ac9a"
+dependencies = [
+ "capstone-sys",
+ "libc",
+]
+
+[[package]]
+name = "capstone-sys"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2267cb8d16a1e4197863ec4284ffd1aec26fe7e57c58af46b02590a0235809a0"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -2063,6 +2083,7 @@ dependencies = [
  "brotli",
  "bytes",
  "caith",
+ "capstone",
  "chrono",
  "dotenvy",
  "emojis",
@@ -2080,6 +2101,7 @@ dependencies = [
  "little_exif",
  "log",
  "nom-exif",
+ "object 0.36.7",
  "rand 0.8.6",
  "regex",
  "reqwest",
@@ -2377,6 +2399,15 @@ dependencies = [
  "smallvec",
  "wide 1.4.0",
  "xprec",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
