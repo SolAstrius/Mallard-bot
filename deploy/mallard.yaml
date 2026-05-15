@@ -86,6 +86,12 @@ spec:
               mountPath: /app/voices
             - name: data
               mountPath: /app/data
+            # Read-only access to the self-hosted Bot API server's file
+            # cache. With --local mode on tbot-api, getFile returns
+            # absolute paths into this tree.
+            - name: tbot-api-files
+              mountPath: /var/lib/telegram-bot-api
+              readOnly: true
           resources:
             requests:
               cpu: "50m"
@@ -103,3 +109,7 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: mallard-data
+        - name: tbot-api-files
+          hostPath:
+            path: /data/k8s/tbot-api
+            type: DirectoryOrCreate

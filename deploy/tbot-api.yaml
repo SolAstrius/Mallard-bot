@@ -13,20 +13,6 @@
 # The pod will CrashLoopBackOff until both keys are present in the secret.
 
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: tbot-api-data
-  namespace: mallard
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: openebs-zfs
-  resources:
-    requests:
-      # Cached files live here; size to taste. Telegram bots can also
-      # auto-evict cached files via `deleteFile`.
-      storage: 20Gi
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,6 +36,10 @@ spec:
         - name: api
           image: aiogram/telegram-bot-api:latest
           imagePullPolicy: IfNotPresent
+          # --local: makes getFile return absolute filesystem paths and
+          # disables the 20 MB download cap. Bot pod reads files directly
+          # from the shared volume.
+          args: ["--local"]
           env:
             - name: TELEGRAM_API_ID
               valueFrom:
@@ -89,9 +79,13 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
+        # hostPath — single-node k3s, same directory mounted into both
+        # tbot-api (writer) and mallard-bot (reader). RWO PVC can't be
+        # mounted by two Deployments simultaneously even on the same node.
         - name: data
-          persistentVolumeClaim:
-            claimName: tbot-api-data
+          hostPath:
+            path: /data/k8s/tbot-api
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

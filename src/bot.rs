@@ -460,11 +460,20 @@ fn describe_media(reply: &Message) -> &'static str {
 
 async fn download_file(bot: &Bot, file_id: FileId) -> anyhow::Result<Vec<u8>> {
     let file = bot.get_file(file_id).await?;
-    // teloxide's `download_file` builds the URL via `path_segments_mut().push`,
-    // which percent-encodes every `/` inside `file.path` to `%2F`. The hosted
-    // api.telegram.org happens to normalize that back, but the self-hosted
-    // telegram-bot-api (Boost HTTP server) treats `%2F` as a literal byte and
-    // 404s. Build the URL manually with raw slashes so both work.
+    // Self-hosted telegram-bot-api in --local mode returns absolute
+    // filesystem paths in `file.path` and stores the file on disk for us
+    // to read directly. When the bot pod has the API server's cache
+    // mounted (read-only), this is the fast path — no HTTP, no cap.
+    if file.path.starts_with('/') {
+        let path = file.path.clone();
+        return tokio::task::spawn_blocking(move || std::fs::read(&path))
+            .await?
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", file.path));
+    }
+    // Otherwise it's a relative path — go through HTTP. teloxide's own
+    // `download_file` percent-encodes the `/`s in `file.path` to `%2F`,
+    // which the hosted api.telegram.org tolerates but other servers
+    // don't; build the URL by hand to keep raw slashes.
     let base = bot.api_url();
     let token = bot.token();
     let base_str = base.as_str().trim_end_matches('/');
