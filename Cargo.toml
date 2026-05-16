@@ -55,6 +55,8 @@ object = { version = "0.36", default-features = false, features = ["read", "std"
 # We want them all for the architecture-guess heuristic.
 capstone = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+toml = "0.8"
+rhai = { version = "1", features = ["sync"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pki-types = "1"

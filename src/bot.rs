@@ -17,7 +17,8 @@ use crate::arguments::{parse_photo_arguments, parse_video_arguments, PhotoQuoteA
 use crate::content::random_emoji;
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
 use crate::imaging::{image_to_emoji, image_to_sticker, FilePreprocessType};
-use crate::mallard::{self, MatchMode, Mallard};
+use crate::mallard::{self, Mallard};
+use crate::triggers;
 use crate::quote::render_quote;
 use crate::responses::ResponseType;
 use crate::stickerpack::{PackKind, StickerPack};
@@ -103,6 +104,8 @@ pub enum Command {
     Binwalk,
     #[command(description = "EXIF / метаданные файла в ответ: /exif")]
     Exif,
+    #[command(hide)]
+    Reload,
 }
 
 const HELP_OVERVIEW: &str = "Кряква умеет превращать кружочки, гифки, видео и картинки в стикеры.\n\
@@ -493,7 +496,7 @@ async fn download_file(bot: &Bot, file_id: FileId) -> anyhow::Result<Vec<u8>> {
 async fn handle_text(
     bot: Bot,
     msg: Message,
-    mallard: SharedMallard,
+    _mallard: SharedMallard,
     config: BotConfig,
 ) -> anyhow::Result<()> {
     track_membership(&msg, &config).await;
@@ -531,15 +534,21 @@ async fn handle_text(
             Vec::new()
         });
 
-    let response = pick_ambient_response(&text, &rules, &mallard).await;
-    let Some((reply_text, reply_type, quote)) = response else {
+    let pack = triggers::current();
+    let ctx = triggers::MsgCtx::new(&text, chat.0);
+    let Some(hit) = triggers::scan(&pack, &rules, &ctx) else {
         return Ok(());
     };
+    let (reply_text, reply_type, quote) = (hit.reply_text, hit.reply_type, hit.quote);
 
     let scream_on = features::parse_bool(&features::resolve(&rules, "ambient.scream").0)
         .unwrap_or(true);
     let (reply_text, reply_type) = if scream_on {
-        mallard::maybe_scream((reply_text, reply_type))
+        let rate = features::resolve(&rules, "ambient.scream.rate")
+            .0
+            .parse::<u32>()
+            .unwrap_or(300);
+        mallard::maybe_scream(rate, (reply_text, reply_type))
     } else {
         (reply_text, reply_type)
     };
@@ -583,78 +592,8 @@ async fn handle_text(
     Ok(())
 }
 
-/// Resolve the ambient pipeline for one incoming text message. Returns the
-/// reply (with its quote, if any) or `None` if nothing should fire.
-///
-/// Pipeline order:
-///   1. Keyword candidates — substring scan from `mallard::scan_keywords`.
-///   2. Per-keyword bool filter (`ambient.keywords.<group>.<leaf>`).
-///   3. Per-group mode re-test (`ambient.keywords.<group>.mode`).
-///   4. Random pick from survivors; the quote is the matched substring.
-///   5. If nothing matched, fall back to the random roulette (gated by
-///      `ambient.random`); the random reply isn't tied to any substring so
-///      no quote is attached.
-async fn pick_ambient_response(
-    text: &str,
-    rules: &[(String, String)],
-    mallard: &SharedMallard,
-) -> Option<(String, ResponseType, Option<(String, u32)>)> {
-    let upper = text.to_uppercase();
-    let candidates = mallard::scan_keywords(text);
-
-    let mut survivors: Vec<(crate::dictionaries::Keyword, (usize, usize))> = Vec::new();
-    for cand in &candidates {
-        let kw = cand.keyword;
-        let flag = kw.flag_path();
-        let enabled = features::parse_bool(&features::resolve(rules, &flag).0).unwrap_or(true);
-        if !enabled {
-            continue;
-        }
-        let mode_str = features::resolve(rules, &kw.mode_path()).0;
-        let mode = MatchMode::parse(&mode_str).unwrap_or(MatchMode::Contains);
-
-        // Re-test under the mode using every trigger string registered for
-        // this keyword — multiple substrings can map to the same Keyword
-        // (e.g. "ДА НУ" and "ДА ЛАДНО" both → DaNu).
-        let span = crate::dictionaries::TEXT_KEYWORDS
-            .iter()
-            .filter(|(_, k)| *k == kw)
-            .find_map(|(kw_str, _)| mallard::match_keyword(mode, &upper, kw_str));
-        if let Some(span) = span {
-            survivors.push((kw, span));
-        }
-    }
-
-    if !survivors.is_empty() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let pick = survivors[rng.gen_range(0..survivors.len())];
-        let (reply_text, reply_type) = mallard::pick_reply(pick.0)?;
-        let (start, end) = pick.1;
-        let quote_str = text.get(start..end).map(str::to_string);
-        let quote_pos = utf16_offset(text, start);
-        let quote = quote_str.map(|q| (q, quote_pos));
-        return Some((reply_text, reply_type, quote));
-    }
-
-    let random_on = features::parse_bool(&features::resolve(rules, "ambient.random").0)
-        .unwrap_or(true);
-    if !random_on {
-        return None;
-    }
-    let (text, ty) = mallard.lock().await.generate_random_answer()?;
-    Some((text, ty, None))
-}
-
-/// Telegram counts `quote_position` in UTF-16 code units, not bytes. Convert
-/// `byte_pos` (in the original UTF-8 string) to its UTF-16 offset by summing
-/// `len_utf16()` for every char preceding the position.
-fn utf16_offset(s: &str, byte_pos: usize) -> u32 {
-    s[..byte_pos.min(s.len())]
-        .chars()
-        .map(|c| c.len_utf16() as u32)
-        .sum()
-}
+// Ambient pipeline now lives in `crate::triggers::scan`. The legacy
+// `pick_ambient_response` / `utf16_offset` helpers moved into the engine.
 
 async fn handle_command(
     bot: Bot,
@@ -696,6 +635,7 @@ async fn handle_command(
         Command::File => "file".to_string(),
         Command::Binwalk => "binwalk".to_string(),
         Command::Exif => "exif".to_string(),
+        Command::Reload => "reload".to_string(),
     };
     let reply_kind = msg.reply_to_message().map(describe_media).unwrap_or("none");
     log::info!(
@@ -741,6 +681,7 @@ async fn handle_command(
         Command::File => handle_file_inspect(&bot, &msg, &config, FileInspect::Summary).await,
         Command::Binwalk => handle_file_inspect(&bot, &msg, &config, FileInspect::Binwalk).await,
         Command::Exif => handle_file_inspect(&bot, &msg, &config, FileInspect::Exif).await,
+        Command::Reload => handle_reload(&bot, &msg, &config).await,
     };
     if let Err(e) = result {
         let body = if let Some(pe) = e.downcast_ref::<ProcessingError>() {
@@ -1163,6 +1104,82 @@ async fn handle_voice(
     bot.send_message(msg.chat.id, format!("saved {path}"))
         .reply_parameters(reply_params(msg))
         .await?;
+    Ok(())
+}
+
+/// `/reload` — admin-only, DM-only. With no reply: re-read the trigger pack
+/// from `$MALLARD_TRIGGERS_PATH` (falling back to the built-in). When sent
+/// as a reply to a Document message: download the doc, validate it as a
+/// trigger pack, persist it to disk, and atomically swap the live pack.
+async fn handle_reload(bot: &Bot, msg: &Message, config: &BotConfig) -> anyhow::Result<()> {
+    let Some(from) = msg.from.as_ref() else {
+        return Ok(());
+    };
+    let Some(admin) = config.admin_id else {
+        return Ok(());
+    };
+    if from.id != admin {
+        return Ok(());
+    }
+    if !matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_)) {
+        return Ok(());
+    }
+
+    // Reply mode: pull TOML from the replied-to Document.
+    if let Some(reply) = msg.reply_to_message() {
+        let doc = match &reply.kind {
+            MessageKind::Common(c) => match &c.media_kind {
+                MediaKind::Document(d) => Some(&d.document),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(doc) = doc {
+            let bytes = download_file(bot, doc.file.id.clone()).await?;
+            let toml_str = match std::str::from_utf8(&bytes) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("файл не UTF-8: {e}"))
+                        .reply_parameters(reply_params(msg))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            match triggers::swap_and_persist(&toml_str) {
+                Ok(n) => {
+                    bot.send_message(
+                        msg.chat.id,
+                        format!("кря: пак обновлён — {n} триггеров, сохранено в {}.", triggers::on_disk_path().display()),
+                    )
+                    .reply_parameters(reply_params(msg))
+                    .await?;
+                }
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("кря-кря, не сложилось: {e}"))
+                        .reply_parameters(reply_params(msg))
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // Bare /reload: re-read from disk (or fall back to built-in).
+    match triggers::reload_from_disk() {
+        Ok(n) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("кря: перечитал {} — {n} триггеров.", triggers::on_disk_path().display()),
+            )
+            .reply_parameters(reply_params(msg))
+            .await?;
+        }
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("кря-кря, не сложилось: {e}"))
+                .reply_parameters(reply_params(msg))
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -1651,10 +1668,14 @@ async fn inline_calc(rest: &str) -> Vec<InlineQueryResult> {
 }
 
 fn inline_horoscope() -> Vec<InlineQueryResult> {
-    use crate::dictionaries::CREATURES;
     use rand::seq::SliceRandom;
+    let pack = triggers::current();
     let mut rng = rand::thread_rng();
-    let creature = CREATURES.choose(&mut rng).copied().unwrap_or("Я уточка!");
+    let creature: String = pack
+        .creatures
+        .choose(&mut rng)
+        .cloned()
+        .unwrap_or_else(|| "Я уточка!".to_string());
     let line = HOROSCOPE_LINES
         .choose(&mut rng)
         .copied()
@@ -1853,11 +1874,15 @@ async fn handle_horoscope(bot: &Bot, msg: &Message, config: &BotConfig) -> anyho
     if !is_feature_enabled(config, msg.chat.id, "fun.horoscope").await {
         return Ok(());
     }
-    use crate::dictionaries::CREATURES;
     use rand::seq::SliceRandom;
+    let pack = triggers::current();
     let body = {
         let mut rng = rand::thread_rng();
-        let creature = CREATURES.choose(&mut rng).copied().unwrap_or("Я уточка!");
+        let creature: String = pack
+            .creatures
+            .choose(&mut rng)
+            .cloned()
+            .unwrap_or_else(|| "Я уточка!".to_string());
         let line = HOROSCOPE_LINES.choose(&mut rng).copied().unwrap_or("кря");
         let lead = creature
             .split_whitespace()

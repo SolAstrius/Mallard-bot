@@ -3,7 +3,6 @@ pub mod bot;
 pub mod calc;
 pub mod content;
 pub mod db;
-pub mod dictionaries;
 pub mod dns;
 pub mod exceptions;
 pub mod file_tools;
@@ -20,6 +19,7 @@ pub mod responses;
 pub mod sessions;
 pub mod stickerpack;
 pub mod sym;
+pub mod triggers;
 pub mod typst;
 pub mod video;
 

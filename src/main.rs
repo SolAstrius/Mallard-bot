@@ -26,7 +26,8 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .map(UserId);
 
-    let mallard = Arc::new(Mutex::new(Mallard::new(150)));
+    mallard_bot::triggers::init();
+    let mallard = Arc::new(Mutex::new(Mallard::new()));
     let mut bot = Bot::new(token);
     // Optional: point at a self-hosted Bot API server (raises the 20 MB
     // getFile cap to 2 GB). Set TG_API_URL=http://host:8081 in env.

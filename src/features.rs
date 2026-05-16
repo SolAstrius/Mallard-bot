@@ -17,7 +17,37 @@
 //! `<prefix>.**` (only with `reset`) recursively deletes every rule beneath
 //! that prefix.
 
+use std::sync::RwLock;
+
 use crate::db::Db;
+
+/// Runtime-registered feature leaves, contributed by the trigger pack
+/// (`crate::triggers::publish_features`). Stored as `&'static FeatureDef` so
+/// they slot in alongside `FEATURES` everywhere. Strings inside are leaked
+/// at registration time; the leak is bounded by admin pack-reload actions.
+static DYNAMIC: RwLock<Vec<&'static FeatureDef>> = RwLock::new(Vec::new());
+
+/// Replace the dynamic-feature list. Called by `triggers::publish_features`
+/// after a successful pack load/swap.
+pub fn set_dynamic(defs: Vec<FeatureDef>) {
+    let leaked: Vec<&'static FeatureDef> = defs
+        .into_iter()
+        .map(|d| &*Box::leak(Box::new(d)))
+        .collect();
+    *DYNAMIC.write().unwrap() = leaked;
+}
+
+fn dynamic_snapshot() -> Vec<&'static FeatureDef> {
+    DYNAMIC.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Iterator over both static and dynamic feature defs. Cheap-ish: dynamic
+/// snapshot is cloned (Vec of refs), static iter is free.
+pub fn all_defs() -> Vec<&'static FeatureDef> {
+    let mut out: Vec<&'static FeatureDef> = FEATURES.iter().collect();
+    out.extend(dynamic_snapshot());
+    out
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeSpec {
@@ -86,55 +116,12 @@ pub const FEATURES: &[FeatureDef] = &[
     FeatureDef { path: "ambient.latex.fenced", default: "off", ty: TypeSpec::Bool },
     FeatureDef { path: "ambient.math.dollar",  default: "off", ty: TypeSpec::Bool },
 
-    // ---- ambient: text-keyword triggers ----
-    // Per-keyword bools. To turn off the whole group at once:
-    //   /feature ambient.keywords.<group>.* off
-    // Per-group mode picks how a keyword is matched against incoming text.
-    FeatureDef { path: "ambient.keywords.creatures.kva",   default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.kar",   default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.krya",  default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.hryu",  default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.miu",   default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.mav",   default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.gaing", default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.woof",  default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.creatures.mode",  default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
-
-    // memes is the noisy group — defaults to a tighter match mode, and the
-    // catchphrase-spammiest leaf (DaNu = "да ладно" / "да ну") ships off.
-    FeatureDef { path: "ambient.keywords.memes.danu",  default: "off", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.memes.oyvse", default: "on",  ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.memes.goyda", default: "on",  ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.memes.what",  default: "on",  ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.memes.us",    default: "on",  ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.memes.blin",  default: "on",  ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.memes.mode",  default: "equals", ty: TypeSpec::Enum(KEYWORD_MODES) },
-
-    FeatureDef { path: "ambient.keywords.food.pelmen", default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.food.borsch", default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.food.chai",   default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.food.bread",  default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.food.mode",   default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
-
-    FeatureDef { path: "ambient.keywords.cozy.kiss",          default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.sad",           default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.tired",         default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.hungry",        default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.cold",          default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.sleepy",        default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.hug",           default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.morning_cozy",  default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.brat",          default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.cozy",          default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.bunny",         default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.cozy.mode",          default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
-
-    FeatureDef { path: "ambient.keywords.misc.arch", default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.keywords.misc.mode", default: "contains", ty: TypeSpec::Enum(KEYWORD_MODES) },
-
-    // ---- ambient: random + scream ----
-    FeatureDef { path: "ambient.random", default: "on", ty: TypeSpec::Bool },
-    FeatureDef { path: "ambient.scream", default: "on", ty: TypeSpec::Bool },
+    // ---- ambient: scream ----
+    // Keyword + random triggers are auto-registered from triggers.toml under
+    // `ambient.triggers.<group>.<leaf>` (see crate::triggers). Scream stays
+    // static because it's an outgoing-reply mutator, not a trigger.
+    FeatureDef { path: "ambient.scream",      default: "on",  ty: TypeSpec::Bool },
+    FeatureDef { path: "ambient.scream.rate", default: "300", ty: TypeSpec::Int { min: 1, max: 100_000 } },
 
     // ---- /dns toolkit ----
     FeatureDef { path: "util.dns", default: "on", ty: TypeSpec::Bool },
@@ -154,17 +141,21 @@ pub const FEATURES: &[FeatureDef] = &[
 ];
 
 pub fn def_of(flag: &str) -> Option<&'static FeatureDef> {
-    FEATURES.iter().find(|f| f.path == flag)
+    if let Some(f) = FEATURES.iter().find(|f| f.path == flag) {
+        return Some(f);
+    }
+    dynamic_snapshot().into_iter().find(|f| f.path == flag)
 }
 
 pub fn default_of(flag: &str) -> &'static str {
     def_of(flag).map(|f| f.default).unwrap_or("on")
 }
 
-/// Top-level segments in registration order, deduped.
+/// Top-level segments in registration order, deduped. Includes dynamic
+/// (trigger-pack) leaves alongside static features.
 pub fn categories() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
-    for f in FEATURES {
+    for f in all_defs() {
         let top = f.path.split('.').next().unwrap_or("");
         if !top.is_empty() && !out.contains(&top) {
             out.push(top);
@@ -355,10 +346,11 @@ pub fn normalize_pattern(raw: &str) -> Result<Pattern, String> {
 
     // No wildcard suffix. Either an exact known leaf, or a category prefix
     // that should desugar to <prefix>.*.
-    if FEATURES.iter().any(|f| f.path == input) {
+    let known = all_defs();
+    if known.iter().any(|f| f.path == input) {
         return Ok(Pattern::Exact(input.to_string()));
     }
-    if FEATURES
+    if known
         .iter()
         .any(|f| f.path.starts_with(&format!("{input}.")))
     {
@@ -389,7 +381,7 @@ fn validate_segments(s: &str) -> Result<(), String> {
 
 fn ensure_prefix_covers(prefix: &str) -> Result<(), String> {
     let dotted = format!("{prefix}.");
-    if FEATURES
+    if all_defs()
         .iter()
         .any(|f| f.path == prefix || f.path.starts_with(&dotted))
     {
@@ -402,8 +394,8 @@ fn ensure_prefix_covers(prefix: &str) -> Result<(), String> {
 /// Leaves whose path matches `pat` (exact or wildcard). Used to scope
 /// `/feature <prefix>` queries to a subtree.
 pub fn leaves_matching(pat: &Pattern) -> Vec<&'static FeatureDef> {
-    FEATURES
-        .iter()
+    all_defs()
+        .into_iter()
         .filter(|f| match pat {
             Pattern::Exact(s) => f.path == s,
             Pattern::Wildcard(s) => pattern_matches(s, f.path),
@@ -466,21 +458,26 @@ mod tests {
 
     #[test]
     fn resolve_skips_type_mismatched_wildcard() {
+        crate::triggers::init();
         // bool-y wildcard rule shadows a sibling enum leaf? It must not.
-        let rules = vec![("ambient.keywords.memes.*".to_string(), "off".to_string())];
+        let rules = vec![(
+            "ambient.triggers.memes.*".to_string(),
+            "off".to_string(),
+        )];
         // memes.mode is enum; "off" isn't a valid mode → falls back to default.
-        let (v, by) = resolve(&rules, "ambient.keywords.memes.mode");
+        let (v, by) = resolve(&rules, "ambient.triggers.memes.mode");
         assert_eq!(v, "equals");
         assert!(by.is_none());
         // memes.danu is bool; "off" is fine.
-        assert_eq!(resolve(&rules, "ambient.keywords.memes.danu").0, "off");
+        assert_eq!(resolve(&rules, "ambient.triggers.memes.danu").0, "off");
     }
 
     #[test]
     fn resolve_falls_back_to_default() {
+        crate::triggers::init();
         assert_eq!(resolve(&[], "fun.roll").0, "on");
         assert_eq!(resolve(&[], "nix.npkg").0, "off");
-        assert_eq!(resolve(&[], "ambient.keywords.memes.mode").0, "equals");
+        assert_eq!(resolve(&[], "ambient.triggers.memes.mode").0, "equals");
     }
 
     #[test]
@@ -503,7 +500,8 @@ mod tests {
         );
         assert!(WriteIntent::Literal("endswith".into()).stored_for(bool_def).is_none());
 
-        let mode_def = def_of("ambient.keywords.memes.mode").unwrap();
+        crate::triggers::init();
+        let mode_def = def_of("ambient.triggers.memes.mode").unwrap();
         assert_eq!(
             WriteIntent::Literal("endswith".into())
                 .stored_for(mode_def)
