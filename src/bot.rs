@@ -17,6 +17,7 @@ use crate::arguments::{parse_photo_arguments, parse_video_arguments, PhotoQuoteA
 use crate::content::random_emoji;
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
 use crate::imaging::{image_to_emoji, image_to_sticker, FilePreprocessType};
+use crate::mask::Mask;
 use crate::mallard::{self, MatchMode, Mallard};
 use crate::quote::render_quote;
 use crate::responses::ResponseType;
@@ -127,7 +128,8 @@ const HELP_QVA: &str = "/qva превращает ответное сообще�
 * e<sec> обрежет видео до sec, sec должно быть целым (используется только вместе с s<sec>)\n\
 * x<speed> изменит скорость видео на speed, speed может иметь вид 123.123\n\
 * r — если указан, видео будет инвертировано\n\
-* c — если указан, результат будет круглым (как кружок); для кружка применяется автоматически\n\
+* c — обрезает результат в круг (как кружок); для кружка применяется автоматически\n\
+* m:<форма> — другая маска: circle, square, triangle, diamond, hexagon, star\n\
 * b<id> — добавляет пузырёк, 1 — справа, 2 — сверху, без числа — случайный\n\
 * j — если указан, преобразует результат в формат, подходящий для кастомных эмодзи (100×100)\n\
 * например /qva s5 e7 x2.5 r обрежет видео с 5 по 7 секунды, инвертирует полученный фрагмент и ускорит его в два с половиной раза.\n\
@@ -917,7 +919,7 @@ async fn render_from_reply(
                 .as_ref()
                 .ok_or_else(|| ProcessingError::of(ProcessingErrorKind::WrongSourceType))?;
             let bytes = download_blocking(bot, thumb.file.id.clone()).await?;
-            image_to_sticker(&bytes, FilePreprocessType::Circle, args)
+            image_to_sticker(&bytes, FilePreprocessType::Mask(Mask::Circle), args)
         }
         MediaKind::Photo(p) => {
             let best = p
@@ -980,52 +982,42 @@ async fn handle_qva(
             MessageKind::Common(c) => c,
             _ => return Err(ProcessingError::of(ProcessingErrorKind::WrongSourceType)),
         };
-        let force_circle = args.circle.unwrap_or(false);
+        // Video notes are always circular regardless of args; everything else
+        // honors the explicit mask flag and falls back to VideoThumb.
+        let explicit_mask = args.mask;
+        let pp_for_user = |fallback: VideoPreprocess| match explicit_mask {
+            Some(m) => VideoPreprocess::Mask(m),
+            None => fallback,
+        };
         let (file_id, preprocess) = match &common.media_kind {
-            MediaKind::VideoNote(v) => (v.video_note.file.id.clone(), VideoPreprocess::Circle),
+            MediaKind::VideoNote(v) => (
+                v.video_note.file.id.clone(),
+                pp_for_user(VideoPreprocess::Mask(Mask::Circle)),
+            ),
             MediaKind::Video(v) => {
                 if v.video.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                let pp = if force_circle {
-                    VideoPreprocess::Circle
-                } else {
-                    VideoPreprocess::VideoThumb
-                };
-                (v.video.file.id.clone(), pp)
+                (v.video.file.id.clone(), pp_for_user(VideoPreprocess::VideoThumb))
             }
             MediaKind::Animation(a) => {
                 if a.animation.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                let pp = if force_circle {
-                    VideoPreprocess::Circle
-                } else {
-                    VideoPreprocess::VideoThumb
-                };
-                (a.animation.file.id.clone(), pp)
+                (a.animation.file.id.clone(), pp_for_user(VideoPreprocess::VideoThumb))
             }
             MediaKind::Document(d) => {
                 if d.document.file.size > 10 * 1024 * 1024 {
                     return Err(ProcessingError::of(ProcessingErrorKind::FileTooLarge));
                 }
-                let pp = if force_circle {
-                    VideoPreprocess::Circle
-                } else {
-                    VideoPreprocess::VideoThumb
-                };
-                (d.document.file.id.clone(), pp)
+                (d.document.file.id.clone(), pp_for_user(VideoPreprocess::VideoThumb))
             }
             // Modern Telegram has video stickers — treat them like a video
             // source so /qva on a video sticker round-trips correctly.
-            MediaKind::Sticker(s) if s.sticker.is_video() => {
-                let pp = if force_circle {
-                    VideoPreprocess::Circle
-                } else {
-                    VideoPreprocess::VideoThumb
-                };
-                (s.sticker.file.id.clone(), pp)
-            }
+            MediaKind::Sticker(s) if s.sticker.is_video() => (
+                s.sticker.file.id.clone(),
+                pp_for_user(VideoPreprocess::VideoThumb),
+            ),
             // Still image source — route through the image pipeline and
             // return a static sticker. Animation-only flags (s/e/x/r) have
             // no meaning on a single frame and are silently ignored.
@@ -1039,10 +1031,9 @@ async fn handle_qva(
                     speech_bubble: args.speech_bubble,
                     is_emoji: args.is_emoji,
                 };
-                let preprocess = if force_circle {
-                    FilePreprocessType::Circle
-                } else {
-                    FilePreprocessType::Default
+                let preprocess = match explicit_mask {
+                    Some(m) => FilePreprocessType::Mask(m),
+                    None => FilePreprocessType::Default,
                 };
                 let png = image_to_sticker(&bytes, preprocess, &photo_args)?;
                 return Ok::<_, ProcessingError>(QvaOutput::Still {

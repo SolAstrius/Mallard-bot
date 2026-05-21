@@ -6,6 +6,7 @@ use mallard_bot::imaging::{
     apply_mask, circular_mask, desired_size, fit_longest_edge, image_to_emoji, image_to_sticker,
     over, FilePreprocessType,
 };
+use mallard_bot::mask::Mask;
 
 fn solid(w: u32, h: u32, pixel: [u8; 4]) -> RgbaImage {
     ImageBuffer::from_pixel(w, h, Rgba(pixel))
@@ -93,7 +94,7 @@ fn image_to_sticker_circle_makes_corners_transparent() {
     let src = solid(600, 600, [120, 200, 80, 255]);
     let bytes = image_to_sticker(
         &to_png(&src),
-        FilePreprocessType::Circle,
+        FilePreprocessType::Mask(Mask::Circle),
         &PhotoQuoteArguments::default(),
     )
     .unwrap();
@@ -110,7 +111,7 @@ fn image_to_sticker_circle_non_square_source_silhouette_is_round() {
     let src = solid(1000, 400, [120, 200, 80, 255]);
     let bytes = image_to_sticker(
         &to_png(&src),
-        FilePreprocessType::Circle,
+        FilePreprocessType::Mask(Mask::Circle),
         &PhotoQuoteArguments::default(),
     )
     .unwrap();

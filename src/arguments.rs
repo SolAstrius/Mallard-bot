@@ -4,6 +4,7 @@ use rand::Rng;
 use regex::Regex;
 
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
+use crate::mask::Mask;
 
 // Static bubble image filenames sorted, matching content/bubbles/bubble_images
 // in the Python source.
@@ -22,7 +23,7 @@ pub struct VideoQuoteArguments {
     pub reverse: Option<bool>,
     pub speech_bubble: Option<usize>,
     pub is_emoji: Option<bool>,
-    pub circle: Option<bool>,
+    pub mask: Option<Mask>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -80,7 +81,7 @@ pub fn parse_video_arguments(line: &str) -> Result<VideoQuoteArguments, Processi
     let mut seen_b = 0u32;
     let mut seen_r = 0u32;
     let mut seen_j = 0u32;
-    let mut seen_c = 0u32;
+    let mut seen_mask = 0u32;
 
     let mut words = line.split_whitespace();
     let _ = words.next(); // drop the command itself
@@ -134,14 +135,25 @@ pub fn parse_video_arguments(line: &str) -> Result<VideoQuoteArguments, Processi
                 ));
             }
             result.is_emoji = Some(true);
-        } else if word == "c" {
-            seen_c += 1;
-            if seen_c > 1 {
+        } else if word == "c" || word.starts_with("m:") {
+            seen_mask += 1;
+            if seen_mask > 1 {
                 return Err(err_args(
-                    "Несколько вхождений аргумента 'c*', не знаю, что делать :(",
+                    "Несколько вхождений аргумента маски, не знаю, что делать :(",
                 ));
             }
-            result.circle = Some(true);
+            let m = if word == "c" {
+                Mask::Circle
+            } else {
+                let name = &word[2..];
+                Mask::from_preset(name).ok_or_else(|| {
+                    err_args(format!(
+                        "Не знаю такой маски: \"{name}\". Доступны: \
+                         circle, square, triangle, diamond, hexagon, star."
+                    ))
+                })?
+            };
+            result.mask = Some(m);
         } else {
             return Err(err_args(format!(
                 "\"{}\" не подходит как аргумент для команды.",

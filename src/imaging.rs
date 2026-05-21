@@ -11,13 +11,14 @@ use image::{ImageBuffer, ImageEncoder, ImageReader, Rgba, RgbaImage};
 
 use crate::arguments::{PhotoQuoteArguments, BUBBLE_NAMES};
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
+use crate::mask::{self, Mask};
 
 /// Mirrors the Python `FilePreprocessType` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilePreprocessType {
     #[default]
     Default,
-    Circle,
+    Mask(Mask),
     VideoThumb,
     Animation,
 }
@@ -176,14 +177,14 @@ pub fn image_to_sticker(
     let target = desired_size(args.is_emoji.unwrap_or(false));
 
     img = match preprocess {
-        FilePreprocessType::Circle => {
+        FilePreprocessType::Mask(m) => {
             let (w, h) = img.dimensions();
             let side = w.min(h);
             let x = (w - side) / 2;
             let y = (h - side) / 2;
             let square = image::imageops::crop(&mut img, x, y, side, side).to_image();
             let mut out = image::imageops::resize(&square, target, target, FilterType::Lanczos3);
-            apply_mask(&mut out, &circular_mask(target));
+            apply_mask(&mut out, &mask::render(m, target));
             out
         }
         FilePreprocessType::Default

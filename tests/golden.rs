@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use image::{ImageBuffer, ImageEncoder, Rgba, RgbaImage};
 use mallard_bot::arguments::PhotoQuoteArguments;
 use mallard_bot::imaging::{image_to_emoji, image_to_sticker, FilePreprocessType};
+use mallard_bot::mask::Mask;
 use mallard_bot::quote::render_quote;
 
 fn fixtures_dir() -> PathBuf {
@@ -88,7 +89,7 @@ fn golden_image_to_sticker_circle_solid_green() {
     let src = solid(640, 640, [60, 180, 90, 255]);
     let out = image_to_sticker(
         &to_png(&src),
-        FilePreprocessType::Circle,
+        FilePreprocessType::Mask(Mask::Circle),
         &PhotoQuoteArguments::default(),
     )
     .unwrap();

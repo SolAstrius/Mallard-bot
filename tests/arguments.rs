@@ -102,3 +102,43 @@ fn photo_unknown_token_is_error() {
     let err = parse_photo_arguments("/snap nope").unwrap_err();
     assert_eq!(err.kind, ProcessingErrorKind::ArgumentsParsingError);
 }
+
+#[test]
+fn video_c_is_circle_mask() {
+    let a = parse_video_arguments("/qva c").unwrap();
+    assert_eq!(a.mask, Some(mallard_bot::mask::Mask::Circle));
+}
+
+#[test]
+fn video_m_preset_hexagon() {
+    let a = parse_video_arguments("/qva m:hexagon").unwrap();
+    assert_eq!(a.mask, Some(mallard_bot::mask::Mask::Hexagon));
+}
+
+#[test]
+fn video_m_all_presets_parse() {
+    use mallard_bot::mask::Mask;
+    for (name, expected) in [
+        ("circle", Mask::Circle),
+        ("square", Mask::Square),
+        ("triangle", Mask::Triangle),
+        ("diamond", Mask::Diamond),
+        ("hexagon", Mask::Hexagon),
+        ("star", Mask::Star),
+    ] {
+        let a = parse_video_arguments(&format!("/qva m:{name}")).unwrap();
+        assert_eq!(a.mask, Some(expected), "preset {name}");
+    }
+}
+
+#[test]
+fn video_m_unknown_preset_is_error() {
+    let err = parse_video_arguments("/qva m:nope").unwrap_err();
+    assert_eq!(err.kind, ProcessingErrorKind::ArgumentsParsingError);
+}
+
+#[test]
+fn video_c_and_m_together_is_error() {
+    let err = parse_video_arguments("/qva c m:square").unwrap_err();
+    assert_eq!(err.kind, ProcessingErrorKind::ArgumentsParsingError);
+}

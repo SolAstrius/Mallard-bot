@@ -12,6 +12,7 @@ pub mod features;
 pub mod math;
 pub mod imaging;
 pub mod mallard;
+pub mod mask;
 pub mod nixsearch;
 pub mod nixstatus;
 pub mod plot;

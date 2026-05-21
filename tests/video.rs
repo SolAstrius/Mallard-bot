@@ -4,6 +4,7 @@
 //! is skipped so CI without ffmpeg installed remains green.
 
 use mallard_bot::arguments::VideoQuoteArguments;
+use mallard_bot::mask::Mask;
 use mallard_bot::video::{resolve_arguments, video_to_emoji, video_to_sticker, VideoPreprocess};
 
 #[test]
@@ -196,7 +197,7 @@ async fn video_to_sticker_circle_with_speed_when_ffmpeg_present() {
         speed: Some(2.0),
         ..Default::default()
     };
-    let out = video_to_sticker(&bytes, args, VideoPreprocess::Circle)
+    let out = video_to_sticker(&bytes, args, VideoPreprocess::Mask(Mask::Circle))
         .await
         .unwrap();
     assert!(is_webm(&out));

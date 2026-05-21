@@ -17,7 +17,8 @@ use tokio::process::Command;
 
 use crate::arguments::VideoQuoteArguments;
 use crate::exceptions::{ProcessingError, ProcessingErrorKind};
-use crate::imaging::{circular_mask, desired_size, load_bubble};
+use crate::imaging::{desired_size, load_bubble};
+use crate::mask::{self, Mask};
 
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(75);
 const FFMPEG_BIN: &str = "ffmpeg";
@@ -27,7 +28,7 @@ const STICKER_BYTES_LIMIT: usize = 256 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoPreprocess {
     Default,
-    Circle,
+    Mask(Mask),
     VideoThumb,
 }
 
@@ -163,7 +164,7 @@ fn fit(w: u32, h: u32, desired: u32) -> (u32, u32) {
 }
 
 /// Optional `(side, x, y, target)` describing a center-square crop of the
-/// source followed by a scale to `target × target`. Required for Circle.
+/// source followed by a scale to `target × target`. Required for `Mask(_)`.
 fn build_filter_graph(
     args: &ResolvedVideoArgs,
     preprocess: VideoPreprocess,
@@ -171,9 +172,9 @@ fn build_filter_graph(
 ) -> String {
     let pts = format!("setpts={:.2}*PTS", 1.0 / args.speed);
     match preprocess {
-        VideoPreprocess::Circle => {
+        VideoPreprocess::Mask(_) => {
             let (side, x, y, target) =
-                square_crop.expect("circle preprocess requires square_crop");
+                square_crop.expect("masked preprocess requires square_crop");
             let mut g = format!(
                 "[0:v]crop={side}:{side}:{x}:{y},scale={target}:{target}[sq];\
                  [1:v]alphaextract[alf];[sq][alf]alphamerge[res];"
@@ -243,13 +244,13 @@ pub async fn video_to_sticker(
     }
     let resolved = resolve_arguments(args, duration)?;
     let target = desired_size(resolved.is_emoji);
-    let is_circle = preprocess == VideoPreprocess::Circle;
-    let (new_w, new_h) = if is_circle {
+    let masked = matches!(preprocess, VideoPreprocess::Mask(_));
+    let (new_w, new_h) = if masked {
         (target, target)
     } else {
         fit(w, h, target)
     };
-    let square_crop = if is_circle {
+    let square_crop = if masked {
         let side = w.min(h);
         Some((side, (w - side) / 2, (h - side) / 2, target))
     } else {
@@ -267,16 +268,16 @@ pub async fn video_to_sticker(
         .arg("-i")
         .arg(input.path());
 
-    if is_circle {
+    if let VideoPreprocess::Mask(m) = preprocess {
         mask_file = NamedTempFile::with_suffix(".png")
             .map_err(|e| err_unexpected(format!("mask tempfile: {e}")))?;
-        let mask = circular_mask(target);
-        write_png(mask_file.path(), &mask).await?;
+        let mask_img = mask::render(m, target);
+        write_png(mask_file.path(), &mask_img).await?;
         cmd.arg("-loop").arg("1").arg("-i").arg(mask_file.path());
     }
 
     if let Some(idx) = resolved.speech_bubble {
-        let (bw, bh) = if is_circle { (target, target) } else { (w, h) };
+        let (bw, bh) = if masked { (target, target) } else { (w, h) };
         let bubble = load_bubble(idx, bw, bh)?;
         bubble_file = NamedTempFile::with_suffix(".png")
             .map_err(|e| err_unexpected(format!("bubble tempfile: {e}")))?;
@@ -286,9 +287,9 @@ pub async fn video_to_sticker(
 
     cmd.arg("-filter_complex")
         .arg(build_filter_graph(&resolved, preprocess, square_crop))
-        // VP9 with alpha for circle output, plain VP9 otherwise.
+        // VP9 with alpha for masked output, plain VP9 otherwise.
         .args(["-c:v", "libvpx-vp9", "-auto-alt-ref", "0"]);
-    if preprocess == VideoPreprocess::Circle {
+    if masked {
         cmd.args(["-pix_fmt", "yuva420p"]);
     } else {
         cmd.args(["-pix_fmt", "yuv420p"]);
