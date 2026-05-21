@@ -162,11 +162,22 @@ fn fit(w: u32, h: u32, desired: u32) -> (u32, u32) {
     }
 }
 
-fn build_filter_graph(args: &ResolvedVideoArgs, preprocess: VideoPreprocess) -> String {
+/// Optional `(side, x, y, target)` describing a center-square crop of the
+/// source followed by a scale to `target × target`. Required for Circle.
+fn build_filter_graph(
+    args: &ResolvedVideoArgs,
+    preprocess: VideoPreprocess,
+    square_crop: Option<(u32, u32, u32, u32)>,
+) -> String {
     let pts = format!("setpts={:.2}*PTS", 1.0 / args.speed);
     match preprocess {
         VideoPreprocess::Circle => {
-            let mut g = String::from("[1:v]alphaextract[alf];[0:v][alf]alphamerge[res];");
+            let (side, x, y, target) =
+                square_crop.expect("circle preprocess requires square_crop");
+            let mut g = format!(
+                "[0:v]crop={side}:{side}:{x}:{y},scale={target}:{target}[sq];\
+                 [1:v]alphaextract[alf];[sq][alf]alphamerge[res];"
+            );
             if args.speech_bubble.is_some() {
                 g.push_str("[res][2:v]overlay[res];");
             }
@@ -232,7 +243,18 @@ pub async fn video_to_sticker(
     }
     let resolved = resolve_arguments(args, duration)?;
     let target = desired_size(resolved.is_emoji);
-    let (new_w, new_h) = fit(w, h, target);
+    let is_circle = preprocess == VideoPreprocess::Circle;
+    let (new_w, new_h) = if is_circle {
+        (target, target)
+    } else {
+        fit(w, h, target)
+    };
+    let square_crop = if is_circle {
+        let side = w.min(h);
+        Some((side, (w - side) / 2, (h - side) / 2, target))
+    } else {
+        None
+    };
 
     let output = NamedTempFile::with_suffix(".webm")
         .map_err(|e| err_unexpected(format!("tempfile: {e}")))?;
@@ -245,17 +267,17 @@ pub async fn video_to_sticker(
         .arg("-i")
         .arg(input.path());
 
-    if preprocess == VideoPreprocess::Circle {
+    if is_circle {
         mask_file = NamedTempFile::with_suffix(".png")
             .map_err(|e| err_unexpected(format!("mask tempfile: {e}")))?;
         let mask = circular_mask(target);
-        let mask = image::imageops::resize(&mask, w, h, image::imageops::FilterType::Lanczos3);
         write_png(mask_file.path(), &mask).await?;
         cmd.arg("-loop").arg("1").arg("-i").arg(mask_file.path());
     }
 
     if let Some(idx) = resolved.speech_bubble {
-        let bubble = load_bubble(idx, w, h)?;
+        let (bw, bh) = if is_circle { (target, target) } else { (w, h) };
+        let bubble = load_bubble(idx, bw, bh)?;
         bubble_file = NamedTempFile::with_suffix(".png")
             .map_err(|e| err_unexpected(format!("bubble tempfile: {e}")))?;
         write_png(bubble_file.path(), &bubble).await?;
@@ -263,7 +285,7 @@ pub async fn video_to_sticker(
     }
 
     cmd.arg("-filter_complex")
-        .arg(build_filter_graph(&resolved, preprocess))
+        .arg(build_filter_graph(&resolved, preprocess, square_crop))
         // VP9 with alpha for circle output, plain VP9 otherwise.
         .args(["-c:v", "libvpx-vp9", "-auto-alt-ref", "0"]);
     if preprocess == VideoPreprocess::Circle {

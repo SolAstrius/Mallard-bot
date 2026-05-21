@@ -104,6 +104,32 @@ fn image_to_sticker_circle_makes_corners_transparent() {
 }
 
 #[test]
+fn image_to_sticker_circle_non_square_source_silhouette_is_round() {
+    // Wide source: before the fix, the mask was stretched and the silhouette
+    // came out oval. The shape must be a true circle regardless of aspect.
+    let src = solid(1000, 400, [120, 200, 80, 255]);
+    let bytes = image_to_sticker(
+        &to_png(&src),
+        FilePreprocessType::Circle,
+        &PhotoQuoteArguments::default(),
+    )
+    .unwrap();
+    let out = decode(&bytes);
+    assert_eq!(out.dimensions(), (512, 512));
+    // Points along the cardinal axes near the radius should all be ~opaque;
+    // an oval mask would make top/bottom transparent while leaving left/right opaque.
+    // Mask radius is ~249 px; probe at 240 leaves comfortable headroom on all
+    // four cardinal axes. An oval mask would have transparent top/bottom here.
+    let r = 240;
+    let c = 256;
+    assert!(out.get_pixel(c, c - r)[3] > 200, "top edge should be inside");
+    assert!(out.get_pixel(c, c + r)[3] > 200, "bottom edge should be inside");
+    assert!(out.get_pixel(c - r, c)[3] > 200, "left edge should be inside");
+    assert!(out.get_pixel(c + r, c)[3] > 200, "right edge should be inside");
+    assert_eq!(out.get_pixel(0, 0)[3], 0);
+}
+
+#[test]
 fn image_to_sticker_default_preserves_color() {
     let src = solid(800, 800, [10, 20, 30, 255]);
     let bytes = image_to_sticker(

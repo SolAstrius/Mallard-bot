@@ -177,8 +177,12 @@ pub fn image_to_sticker(
 
     img = match preprocess {
         FilePreprocessType::Circle => {
-            let resized = image::imageops::resize(&img, target, target, FilterType::Lanczos3);
-            let mut out = resized;
+            let (w, h) = img.dimensions();
+            let side = w.min(h);
+            let x = (w - side) / 2;
+            let y = (h - side) / 2;
+            let square = image::imageops::crop(&mut img, x, y, side, side).to_image();
+            let mut out = image::imageops::resize(&square, target, target, FilterType::Lanczos3);
             apply_mask(&mut out, &circular_mask(target));
             out
         }
