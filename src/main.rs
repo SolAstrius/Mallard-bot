@@ -86,12 +86,20 @@ async fn main() -> anyhow::Result<()> {
             .await;
     }
 
-    // SQLite lives on its own PVC, separate from the voices/ audio bucket.
-    let db_path =
-        env::var("MALLARD_DB_PATH").unwrap_or_else(|_| "/app/data/mallard.db".to_string());
-    let db = Db::open(std::path::Path::new(&db_path))
-        .map_err(|e| anyhow::anyhow!("open db {db_path}: {e}"))?;
-    log::info!("db open at {db_path}");
+    let db = if let Ok(url) = env::var("DATABASE_URL") {
+        let db = Db::open_postgres(&url)
+            .await
+            .map_err(|e| anyhow::anyhow!("open postgres: {e}"))?;
+        log::info!("db open (postgres)");
+        db
+    } else {
+        let db_path =
+            env::var("MALLARD_DB_PATH").unwrap_or_else(|_| "/app/data/mallard.db".to_string());
+        let db = Db::open_sqlite(std::path::Path::new(&db_path))
+            .map_err(|e| anyhow::anyhow!("open db {db_path}: {e}"))?;
+        log::info!("db open at {db_path}");
+        db
+    };
 
     let chabani = new_store();
     spawn_reaper(chabani.clone(), db.clone());

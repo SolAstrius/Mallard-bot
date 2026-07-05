@@ -3032,7 +3032,7 @@ async fn handle_feature(
     let mut failed: Vec<String> = Vec::new();
     let mut type_mismatch: Vec<String> = Vec::new();
     for p in &patterns {
-        let outcome: Result<String, rusqlite::Error> = match (&intent, p) {
+        let outcome: Result<String, crate::db::DbError> = match (&intent, p) {
             (WriteIntent::Reset, FeaturePattern::Recursive(prefix)) => config
                 .db
                 .feature_clear_prefix(chat.0, prefix)

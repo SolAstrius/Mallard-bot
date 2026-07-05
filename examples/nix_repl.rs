@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./nix-cache.sqlite"));
     eprintln!("db: {}", db_path.display());
-    let db = Db::open(&db_path)?;
+    let db = Db::open_sqlite(&db_path)?;
 
     // One-shot refresh if catalog is empty or stale. We can't reuse the
     // private refresh fn directly, so trigger the public spawner and wait.

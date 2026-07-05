@@ -1,18 +1,15 @@
-//! Thin async wrapper over a single SQLite connection.
-//!
-//! Schema is created idempotently on open. All access goes through
-//! `spawn_blocking` so the Tokio runtime never holds a blocking sqlite call.
-//! The connection is wrapped in a `Mutex` — fine for this workload (chat-rate
-//! writes, no read fan-out).
-
 use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
+use super::{ChabaniRow, NixPkgRow, NixOptRow, DbError};
+
+type DbResult<T> = std::result::Result<T, DbError>;
+
 #[derive(Clone)]
-pub struct Db {
+pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -23,7 +20,7 @@ fn migrate_chat_features_to_typed(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(chat_features)")?;
     let cols: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<_, _>>()?;
+        .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
     let has_value = cols.iter().any(|c| c == "value");
@@ -190,23 +187,8 @@ CREATE TABLE IF NOT EXISTS cha_gossip_optin (
 );
 ";
 
-#[derive(Debug, Clone)]
-pub struct ChabaniRow {
-    pub id: String,
-    pub label: String,
-    pub origin_chat_id: i64,
-    pub started_at: i64,
-    pub duration_s: i64,
-    pub sips: i64,
-    pub auto_closed: bool,
-    /// JSON array `[{u:user_id, t:"text"}, ...]` — note author + body.
-    pub notes_json: String,
-    /// JSON array `[{u:user_id, n:"name", c:chat_id}, ...]` — frozen at close.
-    pub participants_json: String,
-}
-
-impl Db {
-    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+impl SqliteDb {
+    pub fn open(path: &Path) -> DbResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -235,7 +217,7 @@ impl Db {
         auto_closed: bool,
         notes_json: String,
         participants_json: String,
-    ) -> rusqlite::Result<()> {
+    ) -> DbResult<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -257,10 +239,10 @@ impl Db {
                     participants_json,
                 ],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Most recent `limit` closed chabani for a chat, newest first. Scoped to
@@ -270,7 +252,7 @@ impl Db {
         &self,
         chat_id: i64,
         limit: i64,
-    ) -> rusqlite::Result<Vec<ChabaniRow>> {
+    ) -> DbResult<Vec<ChabaniRow>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -296,16 +278,16 @@ impl Db {
                         participants_json: row.get(8)?,
                     })
                 })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     // ---------- nix catalog ----------
 
-    pub async fn nix_meta_get(&self, key: &str) -> rusqlite::Result<Option<String>> {
+    pub async fn nix_meta_get(&self, key: &str) -> DbResult<Option<String>> {
         let conn = self.conn.clone();
         let key = key.to_string();
         tokio::task::spawn_blocking(move || {
@@ -313,19 +295,19 @@ impl Db {
             let mut stmt = conn.prepare("SELECT value FROM nix_meta WHERE key = ?1")?;
             let mut rows = stmt.query(rusqlite::params![key])?;
             if let Some(row) = rows.next()? {
-                Ok::<_, rusqlite::Error>(Some(row.get(0)?))
+                Ok::<_, DbError>(Some(row.get(0)?))
             } else {
                 Ok(None)
             }
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// True when `nix_pkg` has data but `nix_pkg_extra` doesn't. Indicates a
     /// schema bump landed and the catalog needs a full refresh to repopulate
     /// the extras side.
-    pub async fn nix_extras_missing(&self) -> rusqlite::Result<bool> {
+    pub async fn nix_extras_missing(&self) -> DbResult<bool> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -335,13 +317,13 @@ impl Db {
                 conn.query_row("SELECT EXISTS(SELECT 1 FROM nix_pkg_extra)", [], |r| {
                     r.get(0)
                 })?;
-            Ok::<_, rusqlite::Error>(any_pkg && !any_extra)
+            Ok::<_, DbError>(any_pkg && !any_extra)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
-    pub async fn nix_meta_set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+    pub async fn nix_meta_set(&self, key: &str, value: &str) -> DbResult<()> {
         let conn = self.conn.clone();
         let key = key.to_string();
         let value = value.to_string();
@@ -352,14 +334,14 @@ impl Db {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 rusqlite::params![key, value],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Replace the entire nix_pkg table contents in one transaction.
-    pub async fn replace_nix_packages(&self, rows: Vec<NixPkgRow>) -> rusqlite::Result<usize> {
+    pub async fn replace_nix_packages(&self, rows: Vec<NixPkgRow>) -> DbResult<usize> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.blocking_lock();
@@ -401,14 +383,14 @@ impl Db {
                 }
             }
             tx.commit()?;
-            Ok::<_, rusqlite::Error>(rows.len())
+            Ok::<_, DbError>(rows.len())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Replace the entire nix_opt table contents in one transaction.
-    pub async fn replace_nix_options(&self, rows: Vec<NixOptRow>) -> rusqlite::Result<usize> {
+    pub async fn replace_nix_options(&self, rows: Vec<NixOptRow>) -> DbResult<usize> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.blocking_lock();
@@ -429,17 +411,17 @@ impl Db {
                 }
             }
             tx.commit()?;
-            Ok::<_, rusqlite::Error>(rows.len())
+            Ok::<_, DbError>(rows.len())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     pub async fn search_nix_packages(
         &self,
         query: &str,
         limit: i64,
-    ) -> rusqlite::Result<Vec<NixPkgRow>> {
+    ) -> DbResult<Vec<NixPkgRow>> {
         let conn = self.conn.clone();
         let q = fts_phrase(query);
         let raw = query.trim().to_string();
@@ -464,18 +446,18 @@ impl Db {
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![q, raw, limit], pkg_row_with_extra)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     pub async fn search_nix_options(
         &self,
         query: &str,
         limit: i64,
-    ) -> rusqlite::Result<Vec<NixOptRow>> {
+    ) -> DbResult<Vec<NixOptRow>> {
         let conn = self.conn.clone();
         let q = fts_phrase(query);
         tokio::task::spawn_blocking(move || {
@@ -496,11 +478,11 @@ impl Db {
                         description: row.get(3)?,
                     })
                 })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Lookup packages that provide `binary` as their mainProgram, falling
@@ -510,7 +492,7 @@ impl Db {
         &self,
         binary: &str,
         limit: i64,
-    ) -> rusqlite::Result<Vec<NixPkgRow>> {
+    ) -> DbResult<Vec<NixPkgRow>> {
         let conn = self.conn.clone();
         let b = binary.to_string();
         tokio::task::spawn_blocking(move || {
@@ -530,16 +512,16 @@ impl Db {
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![b, limit], pkg_row_with_extra)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     // ---------- render cache (typst/mitex → file_id) ----------
 
-    pub async fn render_cache_get(&self, doc_hash: &str) -> rusqlite::Result<Option<Vec<String>>> {
+    pub async fn render_cache_get(&self, doc_hash: &str) -> DbResult<Option<Vec<String>>> {
         let conn = self.conn.clone();
         let doc_hash = doc_hash.to_string();
         tokio::task::spawn_blocking(move || {
@@ -559,19 +541,19 @@ impl Db {
                 rusqlite::params![doc_hash],
             );
             match serde_json::from_str::<Vec<String>>(&json) {
-                Ok(v) => Ok::<_, rusqlite::Error>(Some(v)),
+                Ok(v) => Ok::<_, DbError>(Some(v)),
                 Err(_) => Ok(None),
             }
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     pub async fn render_cache_put(
         &self,
         doc_hash: &str,
         file_ids: &[String],
-    ) -> rusqlite::Result<()> {
+    ) -> DbResult<()> {
         let conn = self.conn.clone();
         let doc_hash = doc_hash.to_string();
         let json = serde_json::to_string(file_ids).unwrap_or_else(|_| "[]".to_string());
@@ -588,28 +570,28 @@ impl Db {
                    file_ids_json = excluded.file_ids_json, created = excluded.created",
                 rusqlite::params![doc_hash, json, now],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     // ---------- per-user inline opt-in ----------
 
-    pub async fn inline_opt_in_get(&self, user_id: i64) -> rusqlite::Result<bool> {
+    pub async fn inline_opt_in_get(&self, user_id: i64) -> DbResult<bool> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn.prepare("SELECT 1 FROM inline_opt_in WHERE user_id = ?1")?;
             let mut rows = stmt.query(rusqlite::params![user_id])?;
-            Ok::<_, rusqlite::Error>(rows.next()?.is_some())
+            Ok::<_, DbError>(rows.next()?.is_some())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Flip the user's opt-in state. Returns the new state.
-    pub async fn inline_opt_in_toggle(&self, user_id: i64) -> rusqlite::Result<bool> {
+    pub async fn inline_opt_in_toggle(&self, user_id: i64) -> DbResult<bool> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -621,7 +603,7 @@ impl Db {
                     "DELETE FROM inline_opt_in WHERE user_id = ?1",
                     rusqlite::params![user_id],
                 )?;
-                Ok::<_, rusqlite::Error>(false)
+                Ok::<_, DbError>(false)
             } else {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -635,7 +617,7 @@ impl Db {
             }
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     // ---------- per-chat feature toggles ----------
@@ -645,7 +627,7 @@ impl Db {
         chat_id: i64,
         feature: &str,
         value: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> DbResult<()> {
         let conn = self.conn.clone();
         let feature = feature.to_string();
         let value = value.to_string();
@@ -656,10 +638,10 @@ impl Db {
                  ON CONFLICT(chat_id, feature) DO UPDATE SET value = excluded.value",
                 rusqlite::params![chat_id, feature, value],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// All rules (pattern, value) for a chat. Used by the hierarchical
@@ -668,7 +650,7 @@ impl Db {
     pub async fn feature_rules_for_chat(
         &self,
         chat_id: i64,
-    ) -> rusqlite::Result<Vec<(String, String)>> {
+    ) -> DbResult<Vec<(String, String)>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -684,10 +666,10 @@ impl Db {
             for r in rows {
                 out.push(r?);
             }
-            Ok::<_, rusqlite::Error>(out)
+            Ok::<_, DbError>(out)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Delete every rule whose pattern starts with `<prefix>.`, plus an
@@ -697,7 +679,7 @@ impl Db {
         &self,
         chat_id: i64,
         prefix: &str,
-    ) -> rusqlite::Result<usize> {
+    ) -> DbResult<usize> {
         let conn = self.conn.clone();
         let exact = prefix.to_string();
         let like = format!("{prefix}.%");
@@ -708,13 +690,13 @@ impl Db {
                  AND (feature = ?2 OR feature LIKE ?3)",
                 rusqlite::params![chat_id, exact, like],
             )?;
-            Ok::<_, rusqlite::Error>(n)
+            Ok::<_, DbError>(n)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
-    pub async fn feature_clear(&self, chat_id: i64, feature: &str) -> rusqlite::Result<()> {
+    pub async fn feature_clear(&self, chat_id: i64, feature: &str) -> DbResult<()> {
         let conn = self.conn.clone();
         let feature = feature.to_string();
         tokio::task::spawn_blocking(move || {
@@ -723,10 +705,10 @@ impl Db {
                 "DELETE FROM chat_features WHERE chat_id = ?1 AND feature = ?2",
                 rusqlite::params![chat_id, feature],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     // ---------- chat membership + per-chat tea visibility ----------
@@ -741,7 +723,7 @@ impl Db {
         chat_id: i64,
         user_name: String,
         now_unix: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> DbResult<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -753,16 +735,16 @@ impl Db {
                      user_name = excluded.user_name",
                 rusqlite::params![user_id, chat_id, now_unix, user_name],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// All user IDs known to belong to `chat_id` per the membership map.
     /// Used by `/cha here` to figure out which participants of a live
     /// chabani are "in this chat" for display.
-    pub async fn users_in_chat(&self, chat_id: i64) -> rusqlite::Result<Vec<i64>> {
+    pub async fn users_in_chat(&self, chat_id: i64) -> DbResult<Vec<i64>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -770,16 +752,16 @@ impl Db {
                 conn.prepare("SELECT user_id FROM user_membership WHERE chat_id = ?1")?;
             let rows = stmt
                 .query_map(rusqlite::params![chat_id], |row| row.get::<_, i64>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// All chat IDs the user has been seen in. Used as the "rooms this
     /// participant is in" set when computing `/sip` echo destinations.
-    pub async fn chats_for_user(&self, user_id: i64) -> rusqlite::Result<Vec<i64>> {
+    pub async fn chats_for_user(&self, user_id: i64) -> DbResult<Vec<i64>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -787,17 +769,17 @@ impl Db {
                 conn.prepare("SELECT chat_id FROM user_membership WHERE user_id = ?1")?;
             let rows = stmt
                 .query_map(rusqlite::params![user_id], |row| row.get::<_, i64>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Toggle a chat's `tea_aware` flag. `on=true` adds the chat to the
     /// `/sip` echo destination set and makes its chabani visible via
     /// `/cha world` in other tea-aware chats.
-    pub async fn set_chat_tea_aware(&self, chat_id: i64, on: bool) -> rusqlite::Result<()> {
+    pub async fn set_chat_tea_aware(&self, chat_id: i64, on: bool) -> DbResult<()> {
         let conn = self.conn.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -813,15 +795,15 @@ impl Db {
                      set_at    = excluded.set_at",
                 rusqlite::params![chat_id, if on { 1 } else { 0 }, now],
             )?;
-            Ok::<_, rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Returns `false` when no row exists. Group chats are off by default;
     /// the handler layer treats DMs as implicitly on.
-    pub async fn is_chat_tea_aware(&self, chat_id: i64) -> rusqlite::Result<bool> {
+    pub async fn is_chat_tea_aware(&self, chat_id: i64) -> DbResult<bool> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -829,18 +811,18 @@ impl Db {
                 conn.prepare("SELECT tea_aware FROM cha_chat_settings WHERE chat_id = ?1")?;
             let mut rows = stmt.query(rusqlite::params![chat_id])?;
             if let Some(row) = rows.next()? {
-                Ok::<_, rusqlite::Error>(row.get::<_, i64>(0)? != 0)
+                Ok::<_, DbError>(row.get::<_, i64>(0)? != 0)
             } else {
                 Ok(false)
             }
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 
     /// Set of chat IDs with `tea_aware = 1`. Cached at the call site for the
     /// duration of one echo fan-out / visibility query.
-    pub async fn tea_aware_chats(&self) -> rusqlite::Result<std::collections::HashSet<i64>> {
+    pub async fn tea_aware_chats(&self) -> DbResult<std::collections::HashSet<i64>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -848,48 +830,14 @@ impl Db {
                 conn.prepare("SELECT chat_id FROM cha_chat_settings WHERE tea_aware = 1")?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, i64>(0))?
-                .collect::<Result<std::collections::HashSet<_>, _>>()?;
-            Ok::<_, rusqlite::Error>(rows)
+                .collect::<std::result::Result<std::collections::HashSet<_>, rusqlite::Error>>()?;
+            Ok::<_, DbError>(rows)
         })
         .await
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+        .map_err(|e| DbError::Other(e.to_string()))?
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NixPkgRow {
-    pub attr_name: String,
-    pub pname: String,
-    pub version: String,
-    pub description: String,
-    pub long_description: String,
-    pub main_program: String,
-    // From nix_pkg_extra. Empty strings when absent.
-    pub homepage: String,
-    pub license: String,
-    /// `pkgs/by-name/.../foo.nix:62` — relative path inside nixpkgs, with
-    /// trailing `:line`. Empty when absent.
-    pub position: String,
-    /// CSV of `<arch>-<os>` triples. Empty when absent.
-    pub platforms: String,
-    /// CSV of github handles. Empty when absent.
-    pub maintainers: String,
-    pub broken: bool,
-    pub insecure: bool,
-    pub unfree: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct NixOptRow {
-    pub name: String,
-    pub type_: String,
-    pub default_: String,
-    pub description: String,
-}
-
-/// Row mapper for `nix_pkg LEFT JOIN nix_pkg_extra` — columns 0..=5 come from
-/// the FTS table, 6..=13 from the extras table (NULLs become empty strings /
-/// false booleans).
 fn pkg_row_with_extra(row: &rusqlite::Row<'_>) -> rusqlite::Result<NixPkgRow> {
     Ok(NixPkgRow {
         attr_name: row.get(0)?,
